@@ -46,7 +46,7 @@ To try a scene without installing anything, open one of the `web/*.html` files i
 ## How it works
 
 ```
-web/         One self-contained HTML/WebGL2 file per scene
+web/         One self-contained HTML/WebGL2 file per scene, and the shared scenes.json list
 mac/         The macOS app (desktop windows, input, switcher) and screen saver
 tools/       Records the screen saver videos
 build.sh     Compiles everything into build/ASCII Wallpapers.app
@@ -70,13 +70,27 @@ window.ascii = {
 };
 ```
 
-Then add it to the `scenes` list in `mac/main.swift` and rebuild:
+Then add it to `web/scenes.json` and rebuild:
 
-```swift
-Scene(id: "<id>", title: "<Title>", stillJS: nil),
+```json
+{ "id": "<id>", "title": "<Title>", "stillJS": null }
 ```
 
-`stillJS` is JavaScript that returns a PNG data URL for the lock screen image. Leave it `nil` to keep the scene off the lock screen.
+`stillJS` is JavaScript that returns a PNG data URL for the lock screen image. Leave it `null` to keep the scene off the lock screen.
+
+## Settings for one machine
+
+Create `~/.config/ascii-wallpapers/config.json` to override any value in a scene's `CFG` on that machine only. This file is optional and stays out of the repo. Restart the app after changing it.
+
+```json
+{
+  "overrides": {
+    "fire": { "cellW": 8, "cellH": 12 }
+  }
+}
+```
+
+Cell sizes are in logical pixels, so characters look half as big on a display at scale 1 as on a Retina display at scale 2. This is the main reason to use an override.
 
 ## Platform support
 

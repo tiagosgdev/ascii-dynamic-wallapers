@@ -12,7 +12,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$SAVER/Contents/MacOS" "$SAVER/Contents/Resources"
 
 swiftc -O -o "$APP/Contents/MacOS/ASCIIWallpapers" mac/main.swift
-cp web/*.html "$APP/Contents/Resources/"
+cp web/*.html web/scenes.json "$APP/Contents/Resources/"
 
 swiftc -O -emit-library -module-name ASCIIWallpapersSaver \
   -o "$SAVER/Contents/MacOS/ASCIIWallpapersSaver" mac/saver.swift

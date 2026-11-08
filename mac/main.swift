@@ -8,18 +8,38 @@ import WebKit
 private let agentLabel = "com.local.asciiwallpapers"
 private let sceneKey = "scene"
 
-private struct Scene {
+private struct Scene: Decodable {
     let id: String       // file name in web/, without .html
     let title: String
     let stillJS: String?  // renders the lock screen frame as a PNG data URL; nil leaves
                           // the lock screen and saver alone while a scene is unfinished
 }
 
-private let scenes = [
-    Scene(id: "blackhole", title: "Black Hole", stillJS: "ascii.frame(0)"),
-    Scene(id: "pond", title: "Koi Pond", stillJS: "(ascii.warp(8),ascii.frame())"),
-    Scene(id: "fire", title: "Campfire", stillJS: "ascii.still()"),
-]
+/// The scene list is shared between platforms and lives in web/scenes.json.
+private let scenes: [Scene] = {
+    guard let url = Bundle.main.url(forResource: "scenes", withExtension: "json"),
+          let data = try? Data(contentsOf: url),
+          let list = try? JSONDecoder().decode([Scene].self, from: data), !list.isEmpty else {
+        fatalError("scenes.json is missing or invalid")
+    }
+    return list
+}()
+
+/// This machine's CFG overrides per scene, from the optional
+/// ~/.config/ascii-wallpapers/config.json. They reach the page as URL parameters.
+private let sceneOverrides: [String: [URLQueryItem]] = {
+    let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/ascii-wallpapers/config.json")
+    guard let data = try? Data(contentsOf: url) else { return [:] }
+    guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let all = root["overrides"] as? [String: [String: Any]] else {
+        NSLog("ASCII Wallpapers: ignoring invalid %@", url.path)
+        return [:]
+    }
+    return all.mapValues { values in
+        values.keys.sorted().map { URLQueryItem(name: $0, value: "\(values[$0]!)") }
+    }
+}()
 
 private let saverName = "ASCII Wallpapers.saver"
 
@@ -52,7 +72,8 @@ final class Wall: NSObject, WKNavigationDelegate {
     }
 
     func load(_ page: URL) {
-        web.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent())
+        // .path leaves out any override parameters on the page's URL.
+        web.loadFileURL(page, allowingReadAccessTo: URL(fileURLWithPath: page.path).deletingLastPathComponent())
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { onLoad(self) }
@@ -90,7 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = Bundle.main.url(forResource: scenes[sceneIndex].id, withExtension: "html") else {
             fatalError("\(scenes[sceneIndex].id).html missing from app bundle")
         }
-        return url
+        guard let items = sceneOverrides[scenes[sceneIndex].id], !items.isEmpty,
+              var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        parts.queryItems = items
+        return parts.url ?? url
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -160,7 +184,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let px = wall.screen.frame.size, scale = wall.screen.backingScaleFactor
         // The page's date is in the name so a rebuilt scene gets a fresh image.
         let prefix = "\(scene.id)-\(Int(px.width * scale))x\(Int(px.height * scale))-"
-        let url = stillsDir.appendingPathComponent("\(prefix)\(Int(modified.timeIntervalSince1970)).png")
+        // Overrides change how the scene looks, so they get a fresh image too.
+        let overrides = currentPage.query.map { q in "-\(q.utf8.reduce(5381 as UInt32) { $0 &* 33 &+ UInt32($1) })" } ?? ""
+        let url = stillsDir.appendingPathComponent("\(prefix)\(Int(modified.timeIntervalSince1970))\(overrides).png")
 
         if fm.fileExists(atPath: url.path) {
             publishStill(url, on: wall.screen)

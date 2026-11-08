@@ -1,0 +1,5 @@
+[
+  { "id": "blackhole", "title": "Black Hole", "stillJS": "ascii.frame(0)" },
+  { "id": "pond", "title": "Koi Pond", "stillJS": "(ascii.warp(8),ascii.frame())" },
+  { "id": "fire", "title": "Campfire", "stillJS": "ascii.still()" }
+]
