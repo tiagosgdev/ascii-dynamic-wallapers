@@ -1021,6 +1021,7 @@ function screenOf(p) {
 // ---- game state ----------------------------------------------------------------
 const rules = chessEngine();
 const STORE = "ascii-chess";
+const STILL_MOVES = ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "d2d3", "g8f6", "c1g5", "d7d6", "b1c3", "c8g4", "d1d2", "d8d7"];
 let humanWhite = true, twoPlayer = false, level = clamp(CFG.level, 0, 2), played = [], resigned = false;
 let buttons = [], hoverButton = "", resetArmed = 0;
 let pieces = [], pieceAt = new Array(128).fill(null);
@@ -1612,6 +1613,30 @@ const ascii = window.ascii = {
   },
   warp(seconds) { for (let i = 0; i < seconds * 30; i++) step(1 / 30); },
   frame() { render(); return canvas.toDataURL("image/png"); },
+  // The lock screen picture: always the same mid-game position, with no text.
+  // Your real game is reloaded from its save afterwards.
+  still() {
+    const keep = { yaw, yawGoal, clock, level, hoverLabel };
+    loadGame({ moves: STILL_MOVES, white: true, level: 1 });
+    lastFrom = lastTo = -1;
+    setMarks();
+    marks.set(marksGoal); marksMoved = true;
+    yaw = yawGoal = CFG.yaw; clock = 12; checkGlow = 0;
+    step(0);
+    overlay.fill(0);
+    gl.bindTexture(gl.TEXTURE_2D, overlayTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, overlay);
+    textDirty = false;
+    render();
+    const png = canvas.toDataURL("image/png");
+    ({ yaw, yawGoal, clock, level, hoverLabel } = keep);
+    loadGame(readSaved());
+    level = readSaved() ? level : keep.level;
+    textDirty = true;
+    step(0);
+    render();
+    return png;
+  },
   // For testing.
   state: () => ({ status, two: twoPlayer, armed: resetArmed > 0, over: gameOver && gameOver.reason, moves: played.slice(), turn: rules.side ? "b" : "w", human: humanWhite ? "w" : "b", level, thinking, selected, hovered, bot: botInfo, active: !!worker, yaw: +yaw.toFixed(1) }),
   squareAt(name, height = 0) {

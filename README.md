@@ -9,6 +9,7 @@ Animated, interactive ASCII-art desktop wallpapers for macOS. Each scene runs li
 | **Black Hole** | A tilted accretion disk that slowly drifts and changes shape as the view orbits | Adds a tiny black hole that spirals in and merges (up to 3 at once) | Warps the view around it | Zooms in and out |
 | **Koi Pond** | Koi swim around the pond | Drops food and the fish swarm to it | Scares the fish | Nothing |
 | **Campfire** | Cold, unlit logs until you light them | See below | Nothing | Nothing |
+| **Chess** | Your game waits while a warm light drifts across the board | Click a piece, then a square | Lifts your pieces, shows their legal moves and names any piece | Orbits the camera |
 
 ### Campfire lifecycle
 
@@ -18,6 +19,17 @@ Animated, interactive ASCII-art desktop wallpapers for macOS. Each scene runs li
 4. It fades over about 2 minutes, then goes out until you light it again.
 
 While it's burning, a burst of quick clicks adds 10 minutes. Pressing and holding the mouse button starts the fade straight away and speeds it up, taking about 4.5 seconds from full to nothing.
+
+### Chess
+
+A full game of chess with all the rules, including castling, en passant, promotion and the draw rules. Games are saved, so they survive switching wallpapers and restarting the app.
+
+- **Bot levels:** click one of the three round pips on the rim near the board's bottom corner for Easy, Medium or Hard. The bot runs in a background worker only on its own turn, for at most about a second.
+- **[ RESET ]:** click twice within 3 seconds to restart the game.
+- **[ MODE ]:** switches between playing the bot and two players sharing the mouse. The position is kept.
+- **Promotion:** a pawn becomes a queen, and you have 3 seconds to click it to change to a rook, bishop or knight.
+- **Resign:** hold your king for about a second.
+- **After a game:** the losing king topples. Click the board for a new game, with colours swapped when playing the bot.
 
 ## Build and run
 
@@ -41,7 +53,7 @@ To try a scene without installing anything, open one of the `web/*.html` files i
 
 **Clicks only count on the bare desktop.** Mouse input is ignored when a window is under the cursor.
 
-**The screen saver is experimental.** It plays pre-recorded videos that aren't included in this repo because of their size, and it hasn't worked reliably. To create them, install `ffmpeg`, run `tools/render-saver.sh`, then run `./build.sh` again. The Campfire has no video yet. The wallpapers work without any of this.
+**The screen saver is experimental.** It plays pre-recorded videos that aren't included in this repo because of their size, and it hasn't worked reliably. To create them, install `ffmpeg`, run `tools/render-saver.sh`, then run `./build.sh` again. The Campfire and Chess have no video yet. The wallpapers work without any of this.
 
 ## How it works
 
