@@ -1,0 +1,1654 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ASCII Chess</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #150c08; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+// ---- tunables -------------------------------------------------------------
+const CFG = {
+  fps: 30,           // while something is moving
+  idleFps: 6,        // while the board just sits in its drifting light
+  cellW: 3,          // CSS px per character
+  cellH: 5,
+  height: .95,       // how much of the screen height the board and pieces fill
+  centerY: .46,      // where the board sits, from the bottom of the screen
+  elev: 43,          // camera height above the table, degrees
+  yaw: 38,           // camera angle round the board, degrees
+  yawMin: -30,       // how far scrolling can orbit
+  yawMax: 72,
+  orbitSpeed: .1,    // degrees per scroll unit
+  moveTime: .34,     // seconds for a piece to travel
+  captureTime: .62,
+  minThink: .55,     // the bot never answers faster than this
+  resetConfirm: 3,   // seconds the reset button waits for its second click
+  promoWait: 3,      // seconds to change a promoted piece before the bot replies
+  resignHold: 1.1,   // seconds holding your king to resign
+  lightPeriod: 70,   // seconds for the light to swing across the board and back
+  level: 1,          // 0 easy, 1 medium, 2 hard
+};
+for (const [k, v] of new URLSearchParams(location.search)) if (k in CFG) CFG[k] = +v;
+
+const RAMP = " .:-=+*%#@";   // symbols only: letters are kept for the pieces
+const GLYPHS = RAMP + "'ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789[]";
+const G = {};
+[...GLYPHS].forEach((c, i) => { if (!(c in G)) G[c] = i; });
+const LEVEL_NAMES = ["EASY", "MEDIUM", "HARD"];
+
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const mix = (a, b, t) => a + (b - a) * t;
+const smooth = t => t * t * (3 - 2 * t);
+const DEG = Math.PI / 180;
+
+// ---- rules and bot ----------------------------------------------------------
+// Runs twice: on the page for the rules, and inside a background worker for the
+// bot, which only does anything during its own turn.
+function chessEngine() {
+  const VAL = [0, 100, 320, 330, 500, 900, 0], PHASE = [0, 0, 1, 1, 2, 4, 0];
+  const PST = [null,
+    [0,0,0,0,0,0,0,0,50,50,50,50,50,50,50,50,10,10,20,30,30,20,10,10,5,5,10,25,25,10,5,5,0,0,0,20,20,0,0,0,5,-5,-10,0,0,-10,-5,5,5,10,10,-20,-20,10,10,5,0,0,0,0,0,0,0,0],
+    [-50,-40,-30,-30,-30,-30,-40,-50,-40,-20,0,0,0,0,-20,-40,-30,0,10,15,15,10,0,-30,-30,5,15,20,20,15,5,-30,-30,0,15,20,20,15,0,-30,-30,5,10,15,15,10,5,-30,-40,-20,0,5,5,0,-20,-40,-50,-40,-30,-30,-30,-30,-40,-50],
+    [-20,-10,-10,-10,-10,-10,-10,-20,-10,0,0,0,0,0,0,-10,-10,0,5,10,10,5,0,-10,-10,5,5,10,10,5,5,-10,-10,0,10,10,10,10,0,-10,-10,10,10,10,10,10,10,-10,-10,5,0,0,0,0,5,-10,-20,-10,-10,-10,-10,-10,-10,-20],
+    [0,0,0,0,0,0,0,0,5,10,10,10,10,10,10,5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,0,0,0,5,5,0,0,0],
+    [-20,-10,-10,-5,-5,-10,-10,-20,-10,0,0,0,0,0,0,-10,-10,0,5,5,5,5,0,-10,-5,0,5,5,5,5,0,-5,0,0,5,5,5,5,0,-5,-10,5,5,5,5,5,0,-10,-10,0,5,0,0,0,0,-10,-20,-10,-10,-5,-5,-10,-10,-20],
+  ];
+  const KING_MID = [-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-20,-30,-30,-40,-40,-30,-30,-20,-10,-20,-20,-20,-20,-20,-20,-10,20,20,0,0,0,0,20,20,20,30,10,0,0,10,30,20];
+  const KING_END = [-50,-40,-30,-20,-20,-30,-40,-50,-30,-20,-10,0,0,-10,-20,-30,-30,-10,20,30,30,20,-10,-30,-30,-10,30,40,40,30,-10,-30,-30,-10,30,40,40,30,-10,-30,-30,-10,20,30,30,20,-10,-30,-30,-30,0,0,0,0,-30,-30,-50,-30,-30,-30,-30,-30,-30,-50];
+  const KNIGHT = [-33, -31, -18, -14, 14, 18, 31, 33], KING = [-17, -16, -15, -1, 1, 15, 16, 17];
+  const ROOK = [-16, -1, 1, 16], BISHOP = [-17, -15, 15, 17];
+  const MATE = 30000, INF = 32000;
+  const LEVELS = [
+    { depth: 2, ms: 80, noise: 110 },    // easy
+    { depth: 5, ms: 300, noise: 0 },     // medium
+    { depth: 16, ms: 1000, noise: 0 },   // hard
+  ];
+
+  // Fixed random numbers, so a position hashes the same on the page and in the worker.
+  let rngState = 1804289383;
+  const rnd = () => {
+    rngState = (rngState + 0x6D2B79F5) | 0;
+    let t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return (t ^ (t >>> 14)) | 0;
+  };
+  const table = n => Int32Array.from({ length: n }, rnd);
+  const ZL = table(15 * 128), ZH = table(15 * 128), CL = table(16), CH = table(16), EL = table(128), EH = table(128);
+  const SL = rnd(), SH = rnd();
+
+  const CASTLE_MASK = new Int8Array(128).fill(15);
+  CASTLE_MASK[0] = 13; CASTLE_MASK[7] = 14; CASTLE_MASK[4] = 12;
+  CASTLE_MASK[112] = 7; CASTLE_MASK[119] = 11; CASTLE_MASK[116] = 3;
+
+  const board = new Int8Array(128);
+  const kings = [4, 116];
+  let side = 0, castle = 15, ep = -1, half = 0, lo = 0, hi = 0, score = 0, phase = 0, hp = 0, played = [];
+  const hist = new Int32Array(2048), uCastle = new Int8Array(2048), uEp = new Int16Array(2048), uHalf = new Int16Array(2048),
+    uCap = new Int8Array(2048), uLo = new Int32Array(2048), uHi = new Int32Array(2048);
+  let sp = 0;
+
+  const value = (p, s) => {
+    const t = p & 7, black = p & 8;
+    const i = black ? (s >> 4) * 8 + (s & 7) : (7 - (s >> 4)) * 8 + (s & 7);
+    const v = VAL[t] + (PST[t] && t < 6 ? PST[t][i] : 0);
+    return black ? -v : v;
+  };
+  function put(p, s) {
+    board[s] = p; score += value(p, s); phase += PHASE[p & 7];
+    lo ^= ZL[p * 128 + s]; hi ^= ZH[p * 128 + s];
+    if ((p & 7) === 6) kings[p >> 3] = s;
+  }
+  function take(s) {
+    const p = board[s];
+    board[s] = 0; score -= value(p, s); phase -= PHASE[p & 7];
+    lo ^= ZL[p * 128 + s]; hi ^= ZH[p * 128 + s];
+    return p;
+  }
+
+  function attacked(s, by) {
+    const enemy = by;
+    const dir = by ? 1 : -1;
+    for (const d of [15, 17]) {
+      const f = s + dir * d;
+      if (!(f & 0x88) && board[f] === (1 | enemy)) return true;
+    }
+    for (let i = 0; i < 8; i++) {
+      let f = s + KNIGHT[i];
+      if (!(f & 0x88) && board[f] === (2 | enemy)) return true;
+      f = s + KING[i];
+      if (!(f & 0x88) && board[f] === (6 | enemy)) return true;
+    }
+    for (let i = 0; i < 4; i++) {
+      for (let f = s + ROOK[i]; !(f & 0x88); f += ROOK[i]) {
+        const p = board[f];
+        if (p) { if (p === (4 | enemy) || p === (5 | enemy)) return true; break; }
+      }
+      for (let f = s + BISHOP[i]; !(f & 0x88); f += BISHOP[i]) {
+        const p = board[f];
+        if (p) { if (p === (3 | enemy) || p === (5 | enemy)) return true; break; }
+      }
+    }
+    return false;
+  }
+  const inCheck = () => attacked(kings[side >> 3], side ^ 8);
+
+  // A move packs from, to, promotion piece and a flag: 1 double push, 2 en passant, 3 castle.
+  const enc = (f, t, promo, flag) => f | (t << 7) | (promo << 14) | (flag << 17);
+  const fromOf = m => m & 127, toOf = m => (m >> 7) & 127, promoOf = m => (m >> 14) & 7, flagOf = m => (m >> 17) & 7;
+
+  function generate(out, n, capturesOnly) {
+    const us = side, them = side ^ 8;
+    for (let s = 0; s < 120; s++) {
+      if (s & 0x88) { s += 7; continue; }
+      const p = board[s];
+      if (!p || (p & 8) !== us) continue;
+      const t = p & 7;
+      if (t === 1) {
+        const dir = us ? -16 : 16, home = us ? 6 : 1, last = us ? 0 : 7;
+        const one = s + dir;
+        if (!board[one]) {
+          if (one >> 4 === last) { out[n++] = enc(s, one, 5, 0); if (!capturesOnly) { out[n++] = enc(s, one, 2, 0); out[n++] = enc(s, one, 4, 0); out[n++] = enc(s, one, 3, 0); } }
+          else if (!capturesOnly) {
+            out[n++] = enc(s, one, 0, 0);
+            if (s >> 4 === home && !board[one + dir]) out[n++] = enc(s, one + dir, 0, 1);
+          }
+        }
+        for (const d of [dir - 1, dir + 1]) {
+          const c = s + d;
+          if (c & 0x88) continue;
+          const v = board[c];
+          if (v && (v & 8) === them) {
+            if (c >> 4 === last) { out[n++] = enc(s, c, 5, 0); out[n++] = enc(s, c, 2, 0); out[n++] = enc(s, c, 4, 0); out[n++] = enc(s, c, 3, 0); }
+            else out[n++] = enc(s, c, 0, 0);
+          } else if (c === ep) out[n++] = enc(s, c, 0, 2);
+        }
+      } else if (t === 2 || t === 6) {
+        const steps = t === 2 ? KNIGHT : KING;
+        for (let i = 0; i < 8; i++) {
+          const c = s + steps[i];
+          if (c & 0x88) continue;
+          const v = board[c];
+          if (v ? (v & 8) === them : !capturesOnly) out[n++] = enc(s, c, 0, 0);
+        }
+      } else {
+        const rays = t === 3 ? BISHOP : t === 4 ? ROOK : KING;
+        const count = t === 5 ? 8 : 4;
+        for (let i = 0; i < count; i++) {
+          for (let c = s + rays[i]; !(c & 0x88); c += rays[i]) {
+            const v = board[c];
+            if (v) { if ((v & 8) === them) out[n++] = enc(s, c, 0, 0); break; }
+            if (!capturesOnly) out[n++] = enc(s, c, 0, 0);
+          }
+        }
+      }
+    }
+    if (!capturesOnly) {
+      const base = us ? 112 : 0, kingside = us ? 4 : 1, queenside = us ? 8 : 2;
+      if ((castle & (kingside | queenside)) && board[base + 4] === (6 | us) && !attacked(base + 4, them)) {
+        if ((castle & kingside) && !board[base + 5] && !board[base + 6] && !attacked(base + 5, them)) out[n++] = enc(base + 4, base + 6, 0, 3);
+        if ((castle & queenside) && !board[base + 3] && !board[base + 2] && !board[base + 1] && !attacked(base + 3, them)) out[n++] = enc(base + 4, base + 2, 0, 3);
+      }
+    }
+    return n;
+  }
+
+  function make(m) {
+    const f = fromOf(m), t = toOf(m), promo = promoOf(m), flag = flagOf(m);
+    const us = side, them = side ^ 8;
+    uCastle[sp] = castle; uEp[sp] = ep; uHalf[sp] = half; uLo[sp] = lo; uHi[sp] = hi;
+    let cap = 0;
+    if (ep >= 0) { lo ^= EL[ep]; hi ^= EH[ep]; }
+    ep = -1;
+    if (flag === 2) cap = take(t + (us ? 16 : -16));
+    else if (board[t]) cap = take(t);
+    uCap[sp] = cap; sp++;
+    const p = take(f);
+    put(promo ? promo | us : p, t);
+    if (flag === 3) {
+      if (t > f) put(take(f + 3), f + 1);
+      else put(take(f - 4), f - 1);
+    }
+    const nc = castle & CASTLE_MASK[f] & CASTLE_MASK[t];
+    lo ^= CL[castle] ^ CL[nc]; hi ^= CH[castle] ^ CH[nc];
+    castle = nc;
+    if (flag === 1) {
+      // Only counts as en passant, for repetition, if a pawn could really take.
+      const left = t - 1, right = t + 1, enemyPawn = 1 | them;
+      if ((!(left & 0x88) && board[left] === enemyPawn) || (!(right & 0x88) && board[right] === enemyPawn)) {
+        ep = (f + t) >> 1; lo ^= EL[ep]; hi ^= EH[ep];
+      }
+    }
+    half = cap || (p & 7) === 1 ? 0 : half + 1;
+    side = them; lo ^= SL; hi ^= SH;
+    hist[hp++] = lo;
+    if (attacked(kings[us >> 3], them)) { undo(m); return false; }
+    return true;
+  }
+
+  function undo(m) {
+    const f = fromOf(m), t = toOf(m), promo = promoOf(m), flag = flagOf(m);
+    side ^= 8; hp--; sp--;
+    const us = side;
+    const p = take(t);
+    put(promo ? 1 | us : p, f);
+    if (flag === 3) {
+      if (t > f) put(take(f + 1), f + 3);
+      else put(take(f - 1), f - 4);
+    }
+    const cap = uCap[sp];
+    if (cap) put(cap, flag === 2 ? t + (us ? 16 : -16) : t);
+    castle = uCastle[sp]; ep = uEp[sp]; half = uHalf[sp]; lo = uLo[sp]; hi = uHi[sp];
+  }
+
+  function setup() {
+    board.fill(0); side = 0; castle = 15; ep = -1; half = 0; lo = 0; hi = 0; score = 0; phase = 0; hp = 0; sp = 0; played = [];
+    [4, 2, 3, 5, 6, 3, 2, 4].forEach((t, f) => {
+      put(t, f); put(1, f + 16); put(1 | 8, f + 96); put(t | 8, f + 112);
+    });
+    lo ^= CL[castle]; hi ^= CH[castle];
+    hist[hp++] = lo;
+  }
+
+  function loadFen(fen) {
+    board.fill(0); side = 0; castle = 0; ep = -1; half = 0; lo = 0; hi = 0; score = 0; phase = 0; hp = 0; sp = 0; played = [];
+    const [rows, stm, cas, e] = fen.split(" ");
+    rows.split("/").forEach((row, i) => {
+      let f = 0;
+      for (const c of row) {
+        if (c >= "1" && c <= "8") { f += +c; continue; }
+        const t = " pnbrqk".indexOf(c.toLowerCase());
+        put(t | (c === c.toLowerCase() ? 8 : 0), (7 - i) * 16 + f++);
+      }
+    });
+    if (stm === "b") { side = 8; lo ^= SL; hi ^= SH; }
+    for (const [c, b] of [["K", 1], ["Q", 2], ["k", 4], ["q", 8]]) if (cas.includes(c)) castle |= b;
+    lo ^= CL[castle]; hi ^= CH[castle];
+    if (e && e !== "-") { ep = (e.charCodeAt(0) - 97) + (e.charCodeAt(1) - 49) * 16; lo ^= EL[ep]; hi ^= EH[ep]; }
+    hist[hp++] = lo;
+  }
+
+  function legal() {
+    const buf = new Int32Array(256), out = [];
+    const n = generate(buf, 0, false);
+    for (let i = 0; i < n; i++) if (make(buf[i])) { undo(buf[i]); out.push(buf[i]); }
+    return out;
+  }
+
+  const sqName = s => String.fromCharCode(97 + (s & 7)) + ((s >> 4) + 1);
+  const uci = m => sqName(fromOf(m)) + sqName(toOf(m)) + (promoOf(m) ? " pnbrq"[promoOf(m)] : "");
+  function playUci(text) {
+    const m = legal().find(x => uci(x) === text);
+    if (m === undefined) return 0;
+    play(m);
+    return m;
+  }
+  function play(m) { make(m); played.push(m); }
+  function takeBack() { undo(played.pop()); }
+
+  function insufficient() {
+    const minors = [], bishops = [];
+    for (let s = 0; s < 120; s++) {
+      if (s & 0x88) { s += 7; continue; }
+      const t = board[s] & 7;
+      if (!t || t === 6) continue;
+      if (t === 2 || t === 3) { minors.push(t); if (t === 3) bishops.push(((s >> 4) + (s & 7)) & 1); }
+      else return false;
+    }
+    if (minors.length <= 1) return true;
+    return minors.length === bishops.length && bishops.every(b => b === bishops[0]);
+  }
+  function repeats() {
+    let same = 0;
+    for (let i = hp - 1; i >= 0 && i >= hp - 1 - half; i--) if (hist[i] === lo) same++;
+    return same;
+  }
+  function status() {
+    const check = inCheck();
+    let over = null;
+    if (!legal().length) over = check ? "checkmate" : "stalemate";
+    else if (insufficient()) over = "material";
+    else if (half >= 100) over = "fifty";
+    else if (repeats() >= 3) over = "repetition";
+    return { check, over };
+  }
+
+  // ---- the bot -------------------------------------------------------------
+  let ttK, ttM, ttS, ttD, ttMask = (1 << 17) - 1;
+  const moveBuf = new Int32Array(256 * 128), orderBuf = new Int32Array(256 * 128);
+  const killA = new Int32Array(128), killB = new Int32Array(128), history = new Int32Array(16384);
+  let deadline = 0, stopped = false, nodes = 0;
+  const now = () => performance.now();
+
+  function evaluate() {
+    const w = (7 - (kings[0] >> 4)) * 8 + (kings[0] & 7), b = (kings[1] >> 4) * 8 + (kings[1] & 7);
+    const p = Math.min(24, phase);
+    let v = score + Math.round(((KING_MID[w] - KING_MID[b]) * p + (KING_END[w] - KING_END[b]) * (24 - p)) / 24);
+    // With a big lead in the endgame, herd the enemy king to the edge.
+    if (p < 8 && Math.abs(score) > 300) {
+      const loser = score > 0 ? kings[1] : kings[0];
+      const edge = Math.max(3 - (loser >> 4), (loser >> 4) - 4, 3 - (loser & 7), (loser & 7) - 4);
+      const close = 14 - Math.abs((kings[0] >> 4) - (kings[1] >> 4)) - Math.abs((kings[0] & 7) - (kings[1] & 7));
+      v += (score > 0 ? 1 : -1) * (edge * 14 + close * 5);
+    }
+    return (side ? -v : v) + 10;
+  }
+
+  function rankMoves(start, end, ttMove, ply) {
+    for (let i = start; i < end; i++) {
+      const m = moveBuf[i], victim = board[toOf(m)] & 7;
+      let s;
+      if (m === ttMove) s = 20000000;
+      else if (victim || flagOf(m) === 2) s = 10000000 + VAL[victim || 1] * 16 - VAL[board[fromOf(m)] & 7];
+      else if (promoOf(m) === 5) s = 9000000;
+      else if (m === killA[ply]) s = 8000000;
+      else if (m === killB[ply]) s = 7900000;
+      else s = history[(m & 16383)];
+      orderBuf[i] = s;
+    }
+  }
+  function pickBest(i, end) {
+    let best = i;
+    for (let j = i + 1; j < end; j++) if (orderBuf[j] > orderBuf[best]) best = j;
+    const m = moveBuf[best]; moveBuf[best] = moveBuf[i]; moveBuf[i] = m;
+    const o = orderBuf[best]; orderBuf[best] = orderBuf[i]; orderBuf[i] = o;
+    return m;
+  }
+
+  function quiesce(alpha, beta, ply, depth) {
+    if ((++nodes & 2047) === 0 && now() > deadline) stopped = true;
+    if (stopped) return 0;
+    const stand = evaluate();
+    if (stand >= beta) return stand;
+    if (stand > alpha) alpha = stand;
+    if (depth <= 0 || ply >= 126) return alpha;
+    const start = ply * 256, end = generate(moveBuf, start, true);
+    rankMoves(start, end, 0, ply);
+    for (let i = start; i < end; i++) {
+      const m = pickBest(i, end);
+      if (!make(m)) continue;
+      const v = -quiesce(-beta, -alpha, ply + 1, depth - 1);
+      undo(m);
+      if (stopped) return 0;
+      if (v >= beta) return v;
+      if (v > alpha) alpha = v;
+    }
+    return alpha;
+  }
+
+  function search(depth, alpha, beta, ply, allowNull) {
+    if ((++nodes & 2047) === 0 && now() > deadline) stopped = true;
+    if (stopped) return 0;
+    if (ply && half >= 100) return 0;
+    if (ply) for (let i = hp - 3; i >= 0 && i >= hp - 1 - half; i -= 2) if (hist[i] === lo) return 0;
+    if (ply >= 120) return evaluate();
+    const check = inCheck();
+    if (check) depth++;
+    if (depth <= 0) return quiesce(alpha, beta, ply, 8);
+
+    const slot = lo & ttMask;
+    let ttMove = 0;
+    if (ttK[slot] === hi) {
+      ttMove = ttM[slot];
+      const info = ttD[slot], d = info >> 2, flag = info & 3;
+      if (d >= depth && ply) {
+        let v = ttS[slot];
+        if (v > MATE - 200) v -= ply; else if (v < -MATE + 200) v += ply;
+        if (flag === 0 || (flag === 1 && v >= beta) || (flag === 2 && v <= alpha)) return v;
+      }
+    }
+
+    if (allowNull && !check && depth >= 3 && phase > 2 && evaluate() >= beta) {
+      const keepEp = ep, keepLo = lo, keepHi = hi;
+      if (ep >= 0) { lo ^= EL[ep]; hi ^= EH[ep]; ep = -1; }
+      side ^= 8; lo ^= SL; hi ^= SH; hist[hp++] = lo;
+      const v = -search(depth - 3, -beta, -beta + 1, ply + 1, false);
+      hp--; side ^= 8; ep = keepEp; lo = keepLo; hi = keepHi;
+      if (stopped) return 0;
+      if (v >= beta) return beta;
+    }
+
+    const start = ply * 256, end = generate(moveBuf, start, false);
+    rankMoves(start, end, ttMove, ply);
+    let legalCount = 0, best = -INF, bestMove = 0, flag = 2;
+    for (let i = start; i < end; i++) {
+      const m = pickBest(i, end);
+      const quiet = !board[toOf(m)] && !promoOf(m) && flagOf(m) !== 2;
+      if (!make(m)) continue;
+      legalCount++;
+      let v;
+      if (legalCount === 1) v = -search(depth - 1, -beta, -alpha, ply + 1, true);
+      else {
+        const reduce = quiet && !check && depth >= 3 && legalCount > 4 ? 1 : 0;
+        v = -search(depth - 1 - reduce, -alpha - 1, -alpha, ply + 1, true);
+        if (v > alpha && (reduce || v < beta)) v = -search(depth - 1, -beta, -alpha, ply + 1, true);
+      }
+      undo(m);
+      if (stopped) return 0;
+      if (v > best) { best = v; bestMove = m; }
+      if (v > alpha) { alpha = v; flag = 0; }
+      if (alpha >= beta) {
+        flag = 1;
+        if (quiet) {
+          if (killA[ply] !== m) { killB[ply] = killA[ply]; killA[ply] = m; }
+          history[m & 16383] = Math.min(6000000, history[m & 16383] + depth * depth);
+        }
+        break;
+      }
+    }
+    if (!legalCount) return check ? -MATE + ply : 0;
+
+    let stored = best;
+    if (stored > MATE - 200) stored += ply; else if (stored < -MATE + 200) stored -= ply;
+    ttK[slot] = hi; ttM[slot] = bestMove; ttS[slot] = stored; ttD[slot] = (depth << 2) | flag;
+    return best;
+  }
+
+  function think(level) {
+    if (!ttK) { const n = ttMask + 1; ttK = new Int32Array(n); ttM = new Int32Array(n); ttS = new Int16Array(n); ttD = new Int16Array(n); }
+    const cfg = LEVELS[level];
+    const start = now();
+    deadline = start + cfg.ms; stopped = false; nodes = 0;
+    killA.fill(0); killB.fill(0); history.fill(0);
+    const root = legal();
+    if (!root.length) return null;
+    if (root.length === 1) return { uci: uci(root[0]), depth: 0, nodes: 0, ms: 0 };
+    const noise = Math.max(cfg.noise, played.length < 8 ? 24 : 0);
+    let best = root[0], reached = 0;
+    for (let d = 1; d <= cfg.depth; d++) {
+      let alpha = -INF, top = -INF, pick = 0;
+      const scored = [];
+      for (const m of root) {
+        if (!make(m)) continue;
+        let v = -search(d - 1, -INF, noise ? INF : -alpha, 1, true);
+        undo(m);
+        if (stopped) break;
+        scored.push([m, v]);
+        const rated = v + (noise ? Math.random() * noise : 0);
+        if (rated > top) { top = rated; pick = m; }
+        if (!noise && v > alpha) alpha = v;
+      }
+      if (pick && (!stopped || scored[0][0] === best)) { best = pick; if (!stopped) reached = d; }
+      if (stopped) break;
+      root.sort((a, b) => (b === best) - (a === best));
+      if (Math.abs(top) > MATE - 200 && !noise) break;
+    }
+    return { uci: uci(best), depth: reached, nodes, ms: Math.round(now() - start) };
+  }
+
+  function perft(d) {
+    if (!d) return 1;
+    const buf = new Int32Array(256), n = generate(buf, 0, false);
+    let total = 0;
+    for (let i = 0; i < n; i++) if (make(buf[i])) { total += perft(d - 1); undo(buf[i]); }
+    return total;
+  }
+
+  setup();
+  return { board, setup, loadFen, legal, play, playUci, takeBack, status, think, perft, uci, inCheck,
+    fromOf, toOf, promoOf, flagOf, get side() { return side; }, kings };
+}
+
+
+// ---- world layout ------------------------------------------------------------
+// Squares are one unit. x right, y up from the board's top, z toward the player.
+const BOARD_R = 4.62, TABLE_Y = -.62, BODY_R = .5;
+const HEIGHTS = [.92, 1.56, 1.87, 1.26, 1.99, 2.28];   // pawn knight bishop rook queen king
+
+// ---- turned-wood piece shapes, baked into a small distance texture -----------
+const PW = 72, PH = 160, UR = .6, YR = 2.4, LAYERS = 8;
+const smin = (a, b, k) => { const h = clamp(.5 + .5 * (b - a) / k, 0, 1); return mix(b, a, h) - k * h * (1 - h); };
+function rbox(r, y, cy, hw, hh, rd) {
+  const dx = Math.abs(r) - hw + rd, dy = Math.abs(y - cy) - hh + rd;
+  return Math.hypot(Math.max(dx, 0), Math.max(dy, 0)) + Math.min(Math.max(dx, dy), 0) - rd;
+}
+const circle = (r, y, cy, R) => Math.hypot(r, y - cy) - R;
+function oval(r, y, cy, a, b) { const k = Math.hypot(r / a, (y - cy) / b); return (k - 1) * Math.min(a, b); }
+function taper(r, y, y0, y1, r0, r1) {
+  const t = clamp((y - y0) / (y1 - y0), 0, 1);
+  return Math.max(Math.abs(r) - mix(r0, r1, t), Math.max(y0 - y, y - y1));
+}
+const foot = (r, y) => smin(rbox(r, y, .07, .33, .07, .03), rbox(r, y, .165, .26, .045, .03), .03);
+// A short head, a tall horse, a pointed mitre, a square tower, a spiked crown, a big cross.
+const HORSE = [[-.24, .34], [.2, .34], [.1, .55], [.0, .78], [.1, .8], [.34, .76], [.46, .83], [.47, .94], [.34, 1.06], [.2, 1.2], [.17, 1.3], [.1, 1.54], [.01, 1.34], [-.12, 1.3], [-.27, 1.1], [-.33, .86], [-.3, .58]];
+function polygon(x, y, pts) {
+  let d = 1e9, s = 1;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i, i++) {
+    const [ax, ay] = pts[i], [bx, by] = pts[j];
+    const ex = bx - ax, ey = by - ay, wx = x - ax, wy = y - ay;
+    const t = clamp((wx * ex + wy * ey) / (ex * ex + ey * ey), 0, 1);
+    d = Math.min(d, Math.hypot(wx - ex * t, wy - ey * t));
+    const c1 = y >= ay, c2 = y < by, c3 = ex * wy > ey * wx;
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s = -s;
+  }
+  return s * d;
+}
+const SHAPES = [
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, .52, .17, .085), .035); d = smin(d, rbox(r, y, .5, .17, .025, .015), .012); return smin(d, circle(r, y, .69, .2), .015); },
+  (r, y) => smin(foot(r, y), taper(r, y, .15, .42, .24, .2), .035),
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.05, .18, .075), .035); d = smin(d, rbox(r, y, 1.03, .19, .025, .015), .012); d = smin(d, oval(r, y, 1.38, .19, .36), .025); return smin(d, circle(r, y, 1.79, .065), .012); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, .9, .2, .19), .03); d = smin(d, rbox(r, y, 1.02, .325, .2, .02), .02); return Math.max(d, -rbox(r, y, 1.24, .2, .09, .01)); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.25, .19, .075), .035); d = smin(d, rbox(r, y, 1.23, .2, .025, .015), .012); d = smin(d, taper(r, y, 1.25, 1.75, .11, .34), .02); return smin(d, circle(r, y, 1.86, .115), .02); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.38, .2, .085), .035); d = smin(d, rbox(r, y, 1.36, .22, .027, .015), .012); d = smin(d, taper(r, y, 1.38, 1.68, .1, .185), .02); d = smin(d, oval(r, y, 1.69, .195, .06), .015); return smin(d, rbox(r, y, 1.8, .085, .1, .02), .02); },
+  (u, y) => polygon(u, y, HORSE) - .012,
+  (u, y) => Math.min(rbox(u, y, 1.99, .072, .29, .012), rbox(u, y, 2.0, .225, .068, .012)),
+];
+const profileData = new Float32Array(PW * PH * LAYERS);
+SHAPES.forEach((fn, layer) => {
+  for (let j = 0; j < PH; j++) for (let i = 0; i < PW; i++) {
+    profileData[(layer * PH + j) * PW + i] = fn((i + .5) / PW * 2 * UR - UR, (j + .5) / PH * YR);
+  }
+});
+
+// ---- shaders --------------------------------------------------------------
+const VERT = `#version 300 es
+void main(){ vec2 p=vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position=vec4(p*2.-1.,0,1); }`;
+
+// Pass 1: one texel per character, ray traced from an orthographic camera.
+// RGB is colour, A is glyph density.
+const SIM = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform vec2 uCellPx, uCenter;
+uniform float uScale, uT;
+uniform vec3 uR, uU, uF, uL;
+uniform vec2 uPool;
+uniform vec4 uA[32];    // xyz base position, w code: type + 10*black + 100*heading
+uniform vec4 uB[32];    // x tilt angle, yz tilt direction, w glow
+uniform sampler2DArray uProf;
+uniform sampler2D uMarks;  // per square: dot, capture ring, selection, last move
+uniform vec4 uCheck;       // xz square, w strength
+uniform vec3 uPips;        // brightness of the three level pips
+layout(location=0) out vec4 o;
+layout(location=1) out vec4 oId;   // which object this character shows, and how far away
+
+const float R=${BOARD_R.toFixed(3)}, TY=${TABLE_Y.toFixed(3)}, BR=${BODY_R.toFixed(3)};
+const float H[6]=float[6](${HEIGHTS.map(h => h.toFixed(3)).join(",")});
+const vec3 GOLD=vec3(1.,.74,.24);
+const int LETTER[6]=int[6](${[..."PNBRQK"].map(c => G[c]).join(",")});
+
+float h21(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+float vn(vec2 p){
+  vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);
+}
+float fbm(vec2 p){
+  float a=.5, s=0.;
+  for(int i=0;i<3;i++){ s+=a*vn(p); p=p*2.03+vec2(3.1,7.7); a*=.5; }
+  return s/.875;
+}
+
+float prof(float u,float y,float layer){
+  return textureLod(uProf,vec3((u+${UR.toFixed(2)})/${(2 * UR).toFixed(2)},y/${YR.toFixed(2)},layer),0.).r;
+}
+float slab(float d2,float z,float hz){ vec2 w=vec2(d2,abs(z)-hz); return min(max(w.x,w.y),0.)+length(max(w,0.)); }
+
+float pieceD(vec3 p,int t,float hd){
+  float r=length(p.xz), y=p.y, d=prof(r,y,float(t));
+  if(t==1){
+    vec2 a=vec2(.788,-.616)*hd;
+    float u=dot(p.xz,a), w=dot(p.xz,vec2(-a.y,a.x));
+    float s2=prof(u,y,6.);
+    d=min(d,slab(s2,w,mix(.17,.1,smoothstep(.55,1.3,y))*(.55+.45*smoothstep(.0,-.15,s2)))-.008);
+  } else if(t==2){
+    if(y>1.38 && p.x>.0) d=max(d,-(abs(p.x*.72+(y-1.64)*.69)-.032));
+  } else if(t==3){
+    if(y>1.02){ vec2 q=abs(vec2(p.x+p.z,p.x-p.z))*.7071; d=max(d,.1-min(q.x,q.y)); }
+  } else if(t==4){
+    if(r>.12 && y>1.42){
+      float a=atan(p.z,p.x), v=pow(abs(cos(a*3.)),3.);
+      d=max(d,(y-(1.42+.36*v))*.7);
+    }
+  } else if(t==5){
+    vec2 a=vec2(.788,-.616);
+    d=min(d,slab(prof(dot(p.xz,a),y,7.),dot(p.xz,vec2(-a.y,a.x)),.075)-.008);
+  }
+  return d;
+}
+vec3 pieceN(vec3 p,int t,float hd){
+  const vec2 e=vec2(.009,-.009);
+  return normalize(e.xyy*pieceD(p+e.xyy,t,hd)+e.yyx*pieceD(p+e.yyx,t,hd)+e.yxy*pieceD(p+e.yxy,t,hd)+e.xxx*pieceD(p+e.xxx,t,hd));
+}
+
+// Rotates about a horizontal axis, for a toppling king.
+vec3 tiltV(vec3 v,vec2 dir,float c,float s){
+  vec3 k=vec3(dir.y,0.,-dir.x);   // axis the piece falls around
+  return v*c+cross(k,v)*s+k*dot(k,v)*(1.-c);
+}
+
+// Soft shadow from every piece, each treated as a tapering post along the light.
+float pieceShadow(vec3 p,int self){
+  float s=1.;
+  vec3 L=uL;
+  for(int i=0;i<32;i++){
+    if(i==self) continue;
+    vec3 a=uA[i].xyz;
+    int t=int(mod(uA[i].w,10.));
+    vec4 B=uB[i];
+    vec3 top=a+vec3(B.y*sin(B.x),cos(B.x),B.z*sin(B.x))*H[t];
+    if(max(a.y,top.y)<p.y) continue;
+    vec2 pa=a.xz-L.xz*(a.y-p.y)/L.y, pb=top.xz-L.xz*(top.y-p.y)/L.y;
+    vec2 e=pb-pa, w=p.xz-pa;
+    float k=clamp(dot(w,e)/max(dot(e,e),1e-4),0.,1.);
+    float d=length(w-e*k), rad=mix(.34,.13,k);
+    s=min(s,smoothstep(rad-.07,rad+.08,d));
+    if(s<.01) break;
+  }
+  return s;
+}
+
+float boardShadow(vec3 p){
+  // Follow the light from a point on the table to see if the board is in the way.
+  vec3 d=uL;
+  float t=(-.0-p.y)/d.y;
+  vec2 q=p.xz+d.xz*t;
+  float out1=max(abs(q.x),abs(q.y))-R;
+  // also the lower edge of the board, so the shadow joins it
+  float t2=(TY-p.y)/d.y;
+  vec2 q2=p.xz+d.xz*max(t2,0.);
+  float out2=max(abs(q2.x),abs(q2.y))-R;
+  return smoothstep(-.06,.06,min(out1,out2));
+}
+
+vec3 lightPool(vec2 q){
+  float d=dot(q-uPool,q-uPool);
+  return mix(vec3(.82,.76,.74),vec3(1.09,1.,.88),exp(-d*.018));
+}
+
+vec3 shadeBoardTop(vec3 p,vec3 rd,float sh,out float dens){
+  vec2 q=p.xz;
+  float ax=max(abs(q.x),abs(q.y));
+  vec3 col;
+  float ndl=max(uL.y,.2)*sh;
+  vec3 lit=lightPool(q)*(.34+.92*ndl);
+  if(ax<4.){
+    vec2 g=q+4.;
+    ivec2 id=clamp(ivec2(floor(g)),ivec2(0),ivec2(7));
+    bool dark=((id.x+id.y)&1)==1;
+    vec2 f=g-vec2(id);
+    float grain=fbm(dark?vec2(q.x*2.2+float(id.y)*3.,q.y*16.+float(id.x)*7.):vec2(q.x*16.+float(id.y)*7.,q.y*2.2+float(id.x)*3.));
+    col=dark?mix(vec3(.15,.07,.022),vec3(.3,.15,.045),grain):mix(vec3(.8,.6,.3),vec3(1.,.85,.52),grain);
+    vec2 toEdge=min(f,1.-f);
+    float seam=smoothstep(.0,.035,min(toEdge.x,toEdge.y));
+    col*=.72+.28*seam;
+    col*=lit;
+    vec4 m=texelFetch(uMarks,id,0);
+    if(m.a>.002) col=mix(col,vec3(.92,.62,.2)*lit*1.05,m.a*.42);
+    if(m.b>.002) col=mix(col,GOLD*1.08,m.b*.62);
+    float dc=length(f-.5);
+    if(uCheck.w>.002 && distance(q,uCheck.xy)<1.){
+      float e=max(abs(q.x-uCheck.x),abs(q.y-uCheck.y));
+      col=mix(col,vec3(.95,.14,.08),uCheck.w*.72*smoothstep(.72,.1,e*1.2));
+    }
+    vec3 mark=dark?vec3(1.,.6,.14):vec3(.58,.2,.03);
+    if(m.r>.002) col=mix(col,mark,min(1.,m.r*1.5)*smoothstep(.235,.17,dc));
+    if(m.g>.002) col=mix(col,mark,min(1.,m.g*1.5)*smoothstep(.08,.035,abs(dc-.4)));
+    dens=dark?.16+.34*grain:.56+.4*grain;
+    dens*=mix(.62,1.,sh);
+    if(m.r>.002 && dc<.2) dens=.95;
+  } else {
+    // the wooden rim round the squares
+    float along=abs(q.x)>abs(q.y)?q.y:q.x;
+    float grain=fbm(vec2(along*2.5,ax*19.));
+    col=mix(vec3(.34,.16,.05),vec3(.62,.36,.14),grain);
+    float groove=smoothstep(.0,.08,ax-4.);
+    col=mix(vec3(.13,.05,.015),col,groove)*lit;
+    float outer=smoothstep(.0,.09,R-ax);
+    col*=.45+.55*outer;
+    dens=.18+.5*grain;
+    // Level pips, set into the rim on the player's side.
+    for(int i=0;i<3;i++){
+      float d=distance(q,vec2(2.42+float(i)*.62,4.31));
+      if(d<.27){
+        float b=i==0?uPips.x:(i==1?uPips.y:uPips.z);
+        col=mix(vec3(.1,.05,.02),mix(vec3(.22,.13,.07),vec3(1.,.6,.14),b),smoothstep(.23,.18,d));
+        dens=.3+.65*b;
+      }
+    }
+  }
+  return col;
+}
+
+vec3 shadeBoardSide(vec3 p,vec3 n,float sh,out float dens){
+  float along=abs(n.x)>.5?p.z:p.x;
+  float grain=fbm(vec2(along*15.,p.y*1.2+along));
+  vec3 col=mix(vec3(.3,.15,.05),vec3(.66,.42,.2),grain);
+  float depth=clamp(-p.y/-TY,0.,1.);
+  col*=mix(1.02,.5,depth*depth);
+  float dl=max(dot(n,uL),0.)*sh;
+  col*=.46+.75*dl;
+  col*=smoothstep(.0,.05,-p.y)*.55+.45;
+  col*=smoothstep(.0,.06,p.y-TY)*.6+.4;
+  dens=.14+.6*grain;
+  return col*lightPool(p.xz);
+}
+
+vec3 shadePiece(vec3 p,vec3 lp,vec3 rd,int t,float black,float hd,int self,vec4 B,out float dens){
+  vec3 n=pieceN(lp,t,hd);
+  if(B.x>0.) n=tiltV(n,B.yz,cos(B.x),sin(B.x));
+  float sh=pieceShadow(p+n*.02,self);
+  float dl=max(dot(n,uL),0.)*sh;
+  float wrap=max(dot(n,uL)*.5+.5,0.);
+  float sky=.5+.5*n.y;
+  vec3 h=normalize(uL-rd);
+  float spec=pow(max(dot(n,h),0.),18.)*sh;
+  float ndv=clamp(dot(n,-rd),0.,1.);
+  float rim=smoothstep(.0,.42,ndv);
+  vec3 base=black>.5?vec3(.62,.31,.15):vec3(.98,.94,.86);
+  vec3 cool=black>.5?vec3(.13,.05,.03):vec3(.36,.34,.38);
+  float form=clamp(dl*1.15+wrap*wrap*.3-.04,0.,1.);
+  vec3 col=mix(cool,base,form);
+  // The turned grooves sit in shade, so collars and heads stand apart.
+  float groove=smoothstep(.0,.05,prof(length(lp.xz)-.035,lp.y,float(t))+.035);
+  col*=mix(.62,1.,groove);
+  // bounce from the warm table underneath, and a polish highlight
+  col+=vec3(.26,.12,.05)*(1.-sky)*(black>.5?.4:.8);
+  col+=(black>.5?vec3(.5,.34,.22):vec3(.42,.38,.32))*spec;
+  if(t==1 && lp.y>.5){
+    // Knight's eye, nostril and dark mane down the back of the neck.
+    vec2 a=vec2(.788,-.616)*hd;
+    float u=dot(lp.xz,a);
+    float edge=prof(u,lp.y,6.);
+    float mane=smoothstep(-.1,-.04,edge)*smoothstep(.02,-.08,u)*step(.62,lp.y);
+    vec3 ink=black>.5?vec3(.06,.025,.015):vec3(.22,.2,.22);
+    col=mix(col,ink,mane*.85);
+    float eye=1.-smoothstep(.038,.058,distance(vec2(u,lp.y),vec2(.17,1.1)));
+    float nose=1.-smoothstep(.022,.04,distance(vec2(u,lp.y),vec2(.4,.92)));
+    col=mix(col,ink*.5,max(eye,nose));
+  }
+  col*=mix(.08,1.,rim);
+  if(B.w>0.) col+=GOLD*B.w*.35*(1.-rim*.5);
+  float l=dot(col,vec3(.3,.55,.15));
+  dens=clamp(.14+l*1.05,.1,1.);
+  return col*lightPool(p.xz);
+}
+
+void main(){
+  vec2 px=(gl_FragCoord.xy*uCellPx-uCellPx*.5)-uCenter;
+  vec2 uv=px/uScale;
+  vec3 rd=uF;
+  vec3 ro=uR*uv.x+uU*uv.y-uF*60.;
+
+  // Nearest hit among the pieces. Bounding posts keep this cheap.
+  float best=1e9; int hit=-1; vec3 hitLocal=vec3(0.);
+  for(int i=0;i<32;i++){
+    vec4 A=uA[i], B=uB[i];
+    int t=int(mod(A.w,10.));
+    vec3 o2=ro-A.xyz, d=rd;
+    vec2 piv=vec2(0.);
+    if(B.x>0.){
+      float c=cos(B.x), s=-sin(B.x);
+      piv=B.yz*.36;
+      o2-=vec3(piv.x,0.,piv.y);
+      o2=tiltV(o2,B.yz,c,s)+vec3(piv.x,0.,piv.y);
+      d=tiltV(d,B.yz,c,s);
+    }
+    float a=dot(d.xz,d.xz);
+    float b=dot(o2.xz,d.xz);
+    float c=dot(o2.xz,o2.xz)-BR*BR;
+    float disc=b*b-a*c;
+    if(disc<0.) continue;
+    disc=sqrt(disc);
+    float t0=(-b-disc)/a, t1=(-b+disc)/a;
+    float ya=o2.y+d.y*t0, yb=o2.y+d.y*t1, h=H[t];
+    float dInv=1./d.y;
+    float s0=(-o2.y)*dInv, s1=(h-o2.y)*dInv;
+    t0=max(t0,min(s0,s1)); t1=min(t1,max(s0,s1));
+    if(t0>=t1 || t0>=best) continue;
+    float hd=mod(A.w,200.)>=100.?-1.:1.;
+    float tt=t0;
+    for(int k=0;k<34 && tt<t1 && tt<best;k++){
+      vec3 q=o2+d*tt;
+      float dist=pieceD(q,t,hd);
+      if(dist<.0035){ best=tt; hit=i; hitLocal=q; break; }
+      tt+=max(dist*.82,.0055);
+    }
+  }
+
+  // The board is a plain box, the table a plane.
+  float tTable=(TY-ro.y)/rd.y;
+  vec3 invD=1./rd;
+  vec3 b0=(vec3(-R,TY,-R)-ro)*invD, b1=(vec3(R,0.,R)-ro)*invD;
+  vec3 mn=min(b0,b1), mx=max(b0,b1);
+  float tIn=max(max(mn.x,mn.y),mn.z), tOut=min(min(mx.x,mx.y),mx.z);
+  bool onBoard=tOut>tIn && tIn>0.;
+
+  vec3 col; float dens=0.; float objId=0., depth=tTable, letter=0.;
+  if(hit>=0 && (!onBoard || best<tIn) && best<tTable){
+    vec4 A=uA[hit], B=uB[hit];
+    int t=int(mod(A.w,10.));
+    float black=mod(A.w,100.)>=10.?1.:0.;
+    float hd=mod(A.w,200.)>=100.?-1.:1.;
+    vec3 p=ro+rd*best;
+    col=shadePiece(p,hitLocal,rd,t,black,hd,hit,B,dens);
+    objId=float(hit+2); depth=best; letter=float(LETTER[t]);
+  } else if(onBoard && tIn<tTable){
+    objId=1.; depth=tIn;
+    vec3 p=ro+rd*tIn;
+    float sh=pieceShadow(p+vec3(0.,.01,0.),-1);
+    if(mn.y>=mn.x && mn.y>=mn.z) col=shadeBoardTop(p,rd,sh,dens);
+    else {
+      vec3 n=mn.x>mn.z?vec3(sign(ro.x),0.,0.):vec3(0.,0.,sign(ro.z));
+      n=mn.x>mn.z?vec3(sign(p.x),0.,0.):vec3(0.,0.,sign(p.z));
+      col=shadeBoardSide(p,n,sh,dens);
+    }
+  } else {
+    vec3 p=ro+rd*tTable;
+    float sh=min(pieceShadow(p,-1),boardShadow(p));
+    // A dark plank table: seams, flowing grain, the odd knot.
+    vec2 q=p.xz;
+    float u=q.x/3.4+.37, id=floor(u), f=u-id, off=h21(vec2(id,3.))*40.;
+    float along=q.y*.18+off, across=q.x*2.6;
+    float flow=fbm(vec2(along*2.,across*.25));
+    float rings=.5+.5*sin((across+flow*5.)*3.4);
+    float grain=fbm(vec2(along*3.,across*2.5));
+    float tone=grain*.55+rings*.45;
+    vec2 kp=vec2((id+.5-.37)*3.4+(h21(vec2(id,7.))-.5)*1.6,(h21(vec2(id,5.))-.5)*22.);
+    float kd=length((q-kp)*vec2(1.,.55));
+    if(kd<1.1){ tone=mix(.5+.5*sin(kd*19.+flow*4.),tone,smoothstep(.3,1.1,kd)); }
+    vec3 tb=mix(vec3(.05,.027,.018),vec3(.19,.105,.062),tone);
+    tb*=.8+.42*h21(vec2(id,9.));
+    tb=mix(vec3(.012,.007,.005),tb,smoothstep(.0,.02,min(f,1.-f)));
+    float dp=dot(q-uPool,q-uPool);
+    tb*=mix(.7,1.4,exp(-dp*.012))*mix(.42,1.,exp(-dot(q,q)*.0055));
+    tb=mix(tb*vec3(.34,.3,.3),tb,sh);
+    col=tb;
+    dens=clamp(.1+.62*tone,.1,.8)*mix(.55,1.,sh);
+  }
+  float dither=(h21(gl_FragCoord.xy)-.5)/255.;
+  o=vec4(col+dither,dens);
+  oId=vec4(objId/255.,clamp((depth-30.)/60.,0.,1.),letter/255.,1.);
+}`;
+
+// Pass 2: full resolution. Characters and a little warm glow.
+const DRAW = `#version 300 es
+precision highp float;
+uniform sampler2D uSim, uOverlay, uAtlas, uIds;
+uniform int uCW, uCH, uH, uGap, uRamp;
+uniform vec2 uRes;
+uniform float uGlow;
+out vec4 o;
+void main(){
+  ivec2 raw=ivec2(gl_FragCoord.xy);
+  ivec2 px=ivec2(raw.x,uH-1-raw.y);
+  ivec2 c=ivec2(px.x/uCW,px.y/uCH), s=px-c*ivec2(uCW,uCH);
+  ivec2 sz=textureSize(uSim,0);
+  ivec2 sc=ivec2(c.x,sz.y-1-c.y);
+  vec4 d=texelFetch(uSim,sc,0);
+  // A dark outline on the nearer object wherever two objects meet.
+  vec4 me=texelFetch(uIds,sc,0);
+  bool edge=false;
+  if(me.r>0.){
+    for(int i=0;i<4;i++){
+      ivec2 n=clamp(sc+(i==0?ivec2(1,0):i==1?ivec2(-1,0):i==2?ivec2(0,1):ivec2(0,-1)),ivec2(0),sz-1);
+      vec4 v=texelFetch(uIds,n,0);
+      if(abs(v.r-me.r)>.001 && me.g<=v.g+.0005) edge=true;
+    }
+  }
+  vec4 ov=texelFetch(uOverlay,c,0);
+  bool inside=s.x<uCW-uGap && s.y<uCH-uGap;
+  vec3 col;
+  int oa=int(ov.a*255.+.5);
+  if(oa!=0){
+    // Each letter spans two by two characters; the top bits say which quarter this is.
+    ivec2 q=ivec2((oa>>6)&1,(oa>>7)&1);
+    float ink=texelFetch(uAtlas,ivec2((oa&63)*uCW+(q.x*uCW+s.x)/2,(q.y*uCH+s.y)/2),0).r;
+    col=mix(d.rgb,ov.rgb,ink);
+  } else if(edge){
+    col=inside?vec3(.09,.04,.022):vec3(.05,.022,.012);
+  } else if(d.a>=.1){
+    int g=clamp(int(d.a*float(uRamp-1))+1,1,uRamp-1);
+    if(me.b>0.) g=int(me.b*255.+.5);   // a piece is drawn with its own letter
+    float ink=texelFetch(uAtlas,ivec2(g*uCW+s.x,s.y),0).r;
+    float ground=me.r==0.?.62:(me.b>0.?.6:.46);
+    col=mix(d.rgb*ground,min(vec3(1.),d.rgb*(me.r==0.?1.3:1.5)+.03),ink);
+  } else col=d.rgb;
+  vec2 uv=gl_FragCoord.xy/uRes;
+  col+=textureLod(uSim,uv,3.5).rgb*vec3(.09,.06,.04)*uGlow;
+  o=vec4(col,1.);
+}`;
+
+// ---- GL setup --------------------------------------------------------------
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", {
+  alpha: false, antialias: false, depth: false, stencil: false, powerPreference: "low-power",
+});
+if (!gl) throw new Error("WebGL2 unavailable");
+
+function program(fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; u[name.replace("[0]", "")] = gl.getUniformLocation(p, name); }
+  return { p, u };
+}
+const sim = program(SIM), draw = program(DRAW);
+gl.bindVertexArray(gl.createVertexArray());
+
+function texture(target, minFilter, magFilter) {
+  const tex = gl.createTexture();
+  gl.bindTexture(target, tex);
+  gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, minFilter);
+  gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, magFilter);
+  gl.texParameteri(target, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(target, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+const simTex = texture(gl.TEXTURE_2D, gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
+const overlayTex = texture(gl.TEXTURE_2D, gl.NEAREST, gl.NEAREST);
+const atlasTex = texture(gl.TEXTURE_2D, gl.NEAREST, gl.NEAREST);
+const idTex = texture(gl.TEXTURE_2D, gl.NEAREST, gl.NEAREST);
+const marksTex = texture(gl.TEXTURE_2D, gl.NEAREST, gl.NEAREST);
+const profTex = texture(gl.TEXTURE_2D_ARRAY, gl.LINEAR, gl.LINEAR);
+gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.R16F, PW, PH, LAYERS, 0, gl.RED, gl.FLOAT, profileData);
+gl.bindTexture(gl.TEXTURE_2D, marksTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 8, 8, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+const fbo = gl.createFramebuffer();
+
+let W = 0, H = 0, cw = 0, ch = 0, cols = 0, rows = 0, overlay = new Uint8Array(4), scale = 1, cx = 0, cy = 0;
+
+function buildAtlas() {
+  const cv = document.createElement("canvas");
+  cv.width = cw * GLYPHS.length; cv.height = ch;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#fff";
+  g.font = `700 ${Math.round(ch * .95)}px Menlo, "DejaVu Sans Mono", ui-monospace, monospace`;
+  g.textAlign = "center"; g.textBaseline = "middle";
+  for (let i = 0; i < GLYPHS.length; i++) g.fillText(GLYPHS[i], cw * (i + .5), ch * .54);
+  gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  const ncw = Math.max(3, Math.round(CFG.cellW * dpr)), nch = Math.max(5, Math.round(CFG.cellH * dpr));
+  if (w === W && h === H && ncw === cw && nch === ch) return;
+  W = canvas.width = w; H = canvas.height = h; cw = ncw; ch = nch;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  overlay = new Uint8Array(cols * rows * 4);
+  // Fit the board, its rim, and the tallest pieces, at the widest camera angle.
+  const span = 2 * BOARD_R * Math.SQRT2;
+  scale = Math.min(H * CFG.height / (span * Math.sin(CFG.elev * DEG) + 3), W * .72 / (span + 3));
+  cx = W / 2; cy = rows * ch * CFG.centerY;
+  gl.bindTexture(gl.TEXTURE_2D, simTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, simTex, 0);
+  gl.bindTexture(gl.TEXTURE_2D, idTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, idTex, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindTexture(gl.TEXTURE_2D, overlayTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, overlay);
+  buildAtlas();
+  textDirty = true; wake();
+}
+
+// ---- camera ---------------------------------------------------------------------
+let yaw = CFG.yaw, yawGoal = CFG.yaw;
+function basis() {
+  const el = CFG.elev * DEG, y = yaw * DEG;
+  const ce = Math.cos(el), se = Math.sin(el), cyaw = Math.cos(y), syaw = Math.sin(y);
+  return { F: [-syaw * ce, -se, -cyaw * ce], R: [cyaw, 0, -syaw], U: [-syaw * se, ce, -cyaw * se] };
+}
+function rayAt(fx, fy) {
+  const b = basis();
+  const sx = (fx * W - cx) / scale, sy = ((rows * ch - fy * H) - cy) / scale;
+  return { o: [0, 1, 2].map(k => b.R[k] * sx + b.U[k] * sy - b.F[k] * 60), d: b.F };
+}
+function screenOf(p) {
+  const b = basis(), dot = (u, v) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  return { x: (cx + dot(p, b.R) * scale) / W, y: (rows * ch - (cy + dot(p, b.U) * scale)) / H };
+}
+
+// ---- game state ----------------------------------------------------------------
+const rules = chessEngine();
+const STORE = "ascii-chess";
+let humanWhite = true, twoPlayer = false, level = clamp(CFG.level, 0, 2), played = [], resigned = false;
+let buttons = [], hoverButton = "", resetArmed = 0;
+let pieces = [], pieceAt = new Array(128).fill(null);
+let selected = -1, hovered = -1, targets = [], lastFrom = -1, lastTo = -1;
+let gameOver = null, overAge = 0, thinking = false, thinkStart = 0, requestId = 0, reply = null;
+let promo = null, press = null, status = "", textDirty = true;
+const tableCount = [0, 0];
+
+const humanSide = () => humanWhite ? 0 : 8;
+const humanTurn = () => twoPlayer || rules.side === humanSide();
+function squareWorld(s) {
+  const f = s & 7, r = s >> 4;
+  return humanWhite ? [f - 3.5, 3.5 - r] : [3.5 - f, r - 3.5];
+}
+function worldSquare(x, z) {
+  const i = Math.floor(x + 4), j = Math.floor(z + 4);
+  if (i < 0 || i > 7 || j < 0 || j > 7) return -1;
+  return humanWhite ? ((7 - j) << 4) | i : (j << 4) | (7 - i);
+}
+const markIndex = s => { const [x, z] = squareWorld(s); return (Math.floor(z + 4) * 8 + Math.floor(x + 4)) * 4; };
+
+function makePieces() {
+  pieces = [];
+  for (let s = 0; s < 120; s++) {
+    if (s & 0x88) { s += 7; continue; }
+    const p = rules.board[s];
+    if (p) pieces.push({ home: s, homeType: p & 7, black: p & 8, type: p & 7, sq: s, x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0, t: 1, dur: 1, hop: 0, lift: 0, liftGoal: 0, tilt: 0, tiltGoal: 0, glow: 0 });
+  }
+}
+function indexPieces() {
+  pieceAt.fill(null);
+  for (const p of pieces) if (p.sq >= 0) pieceAt[p.sq] = p;
+}
+function sendTo(p, x, y, z, dur, hop) {
+  p.fx = p.x; p.fy = p.y; p.fz = p.z;
+  p.tx = x; p.ty = y; p.tz = z; p.t = 0; p.dur = dur; p.hop = hop;
+}
+function place(p, x, y, z) { p.x = p.fx = p.tx = x; p.y = p.fy = p.ty = y; p.z = p.fz = p.tz = z; p.t = 1; }
+function tableSlot(blackPiece) {
+  // Your losses stand on the left of the board, the bot's on the right.
+  const mine = !!blackPiece === !humanWhite;
+  const n = tableCount[blackPiece ? 1 : 0]++;
+  const sign = mine ? -1 : 1;
+  return [sign * (5.75 + (n % 2) * .92), TABLE_Y, -3.15 + (n >> 1) * .92];
+}
+
+function animateMove(m, instant) {
+  const f = rules.fromOf(m), t = rules.toOf(m), flag = rules.flagOf(m), promotion = rules.promoOf(m);
+  const mover = pieceAt[f];
+  const capSq = flag === 2 ? t + (mover.black ? 16 : -16) : t;
+  const cap = pieceAt[capSq];
+  if (cap) {
+    pieceAt[capSq] = null;
+    cap.sq = -1;
+    const [x, y, z] = tableSlot(cap.black);
+    if (instant) place(cap, x, y, z); else sendTo(cap, x, y, z, CFG.captureTime, 1.5);
+  }
+  pieceAt[f] = null;
+  pieceAt[t] = mover;
+  mover.sq = t;
+  if (promotion) mover.type = promotion;
+  const [x, z] = squareWorld(t);
+  if (instant) place(mover, x, 0, z);
+  else sendTo(mover, x, 0, z, CFG.moveTime, mover.type === 2 ? .85 : .14);
+  if (flag === 3) {
+    const rookFrom = t > f ? f + 3 : f - 4, rookTo = t > f ? f + 1 : f - 1;
+    const rook = pieceAt[rookFrom];
+    pieceAt[rookFrom] = null; pieceAt[rookTo] = rook; rook.sq = rookTo;
+    const [rx, rz] = squareWorld(rookTo);
+    if (instant) place(rook, rx, 0, rz); else sendTo(rook, rx, 0, rz, CFG.moveTime * 1.2, .55);
+  }
+  return mover;
+}
+
+function save() {
+  try { localStorage.setItem(STORE, JSON.stringify({ moves: played, white: humanWhite, two: twoPlayer, level, resigned })); } catch (e) { /* private mode */ }
+}
+
+function checkGameEnd(instant) {
+  const st = rules.status();
+  const reason = resigned ? "resign" : st.over;
+  if (!reason) return false;
+  const loserBlack = resigned || st.over === "checkmate" ? rules.side : -1;
+  gameOver = { reason, loser: loserBlack };
+  overAge = instant ? 9 : 0;
+  if (loserBlack >= 0) {
+    const king = pieces.find(p => p.type === 6 && p.black === loserBlack);
+    king.tiltGoal = 1.62;
+    if (instant) king.tilt = 1.62;
+  }
+  return true;
+}
+
+function setMarks() {
+  const legal = humanTurn() && !gameOver && !thinking && !promo ? rules.legal() : [];
+  const src = selected >= 0 ? selected : hovered;
+  targets = src >= 0 ? legal.filter(m => rules.fromOf(m) === src) : [];
+  marksGoal.fill(0);
+  const strong = selected >= 0;
+  for (const m of targets) {
+    const t = rules.toOf(m), i = markIndex(t);
+    const capture = pieceAt[t] || rules.flagOf(m) === 2;
+    marksGoal[i + (capture ? 1 : 0)] = strong ? 255 : 150;
+  }
+  if (selected >= 0) marksGoal[markIndex(selected) + 2] = 255;
+  if (lastFrom >= 0) { marksGoal[markIndex(lastFrom) + 3] = 255; marksGoal[markIndex(lastTo) + 3] = 255; }
+  for (const p of pieces) {
+    p.liftGoal = p.sq === selected && selected >= 0 ? .3 : (p.sq === hovered && hovered >= 0 ? .13 : 0);
+  }
+  textDirty = true;
+  wake();
+}
+
+function playMove(m, instant) {
+  animateMove(m, instant);
+  rules.play(m);
+  played.push(rules.uci(m));
+  lastFrom = rules.fromOf(m); lastTo = rules.toOf(m);
+  selected = hovered = -1;
+  press = null;
+}
+
+function afterMove(instant) {
+  save();
+  const over = checkGameEnd(instant);
+  setMarks();
+  if (!over && !instant && !humanTurn()) askBot();
+}
+
+function chooseMove(m) {
+  const promoting = rules.promoOf(m);
+  playMove(m);
+  if (promoting && !rules.status().over) {
+    promo = { from: rules.fromOf(m), to: rules.toOf(m), age: 0 };
+    save(); setMarks();
+    return;
+  }
+  afterMove();
+}
+
+const PROMO_CYCLE = [5, 4, 3, 2], PROMO_NAMES = { 5: "QUEEN", 4: "ROOK", 3: "BISHOP", 2: "KNIGHT" };
+function cyclePromotion() {
+  const piece = pieceAt[promo.to];
+  const next = PROMO_CYCLE[(PROMO_CYCLE.indexOf(piece.type) + 1) % 4];
+  rules.takeBack();
+  played.pop();
+  const m = rules.legal().find(x => rules.fromOf(x) === promo.from && rules.toOf(x) === promo.to && rules.promoOf(x) === next);
+  rules.play(m);
+  played.push(rules.uci(m));
+  piece.type = next;
+  promo.age = 0;
+  piece.lift = .35;
+  textDirty = true;
+  save(); wake();
+}
+
+function newGame(swapSides = true) {
+  rules.setup();
+  played = []; resigned = false; gameOver = null; promo = null; press = null; selected = hovered = -1; lastFrom = lastTo = -1;
+  if (swapSides && !twoPlayer) humanWhite = !humanWhite;
+  resetArmed = 0;
+  tableCount[0] = tableCount[1] = 0;
+  for (const p of pieces) {
+    p.type = p.homeType; p.sq = p.home; p.tiltGoal = 0;
+    const [x, z] = squareWorld(p.home);
+    sendTo(p, x, 0, z, CFG.moveTime * 2.2, .5);
+  }
+  indexPieces();
+  thinking = false; requestId++;
+  save(); setMarks();
+  if (!humanTurn()) askBot();
+}
+
+// ---- the bot's worker ----------------------------------------------------------
+let worker = null;
+try {
+  const src = `const E=(${chessEngine})();onmessage=e=>{E.setup();for(const m of e.data.moves)E.playUci(m);postMessage({id:e.data.id,best:E.think(e.data.level)});};`;
+  worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  worker.onmessage = e => receive(e.data);
+} catch (e) { worker = null; }
+let fallback = null;
+function askBot() {
+  thinking = true; thinkStart = clock; textDirty = true;
+  requestId++;
+  const msg = { id: requestId, moves: played.slice(), level };
+  if (worker) worker.postMessage(msg);
+  else setTimeout(() => {
+    fallback = fallback || chessEngine();
+    fallback.setup();
+    for (const m of msg.moves) fallback.playUci(m);
+    receive({ id: msg.id, best: fallback.think(Math.min(msg.level, 1)) });
+  }, 30);
+  wake();
+}
+function receive(data) {
+  if (data.id !== requestId || !data.best) return;
+  reply = data.best;
+  botInfo = data.best;
+  wake();
+}
+let botInfo = null;
+function applyReply() {
+  const text = reply.uci;
+  reply = null;
+  thinking = false;
+  const m = rules.legal().find(x => rules.uci(x) === text);
+  if (m === undefined) return;
+  playMove(m);
+  afterMove();
+}
+
+// ---- input ------------------------------------------------------------------------
+function shapeAt(layer, u, y) {
+  const i = Math.floor((u + UR) / (2 * UR) * PW), j = Math.floor(y / YR * PH);
+  if (i < 0 || i >= PW || j < 0 || j >= PH) return 1;
+  return profileData[(layer * PH + j) * PW + i];
+}
+// Whether a point (relative to the piece's base) is on the piece, with a little
+// slack so slim stems are still easy to click.
+function solidAt(p, x, y, z) {
+  const slack = .05, t = p.type;
+  if (shapeAt(t - 1, Math.hypot(x, z), y) < slack) return true;
+  if (t !== 2 && t !== 6) return false;
+  const hd = !!p.black === !humanWhite ? 1 : -1;
+  const ax = .788 * (t === 2 ? hd : 1), az = -.616 * (t === 2 ? hd : 1);
+  const u = x * ax + z * az, w = Math.abs(-x * az + z * ax);
+  return t === 2 ? w < .2 && shapeAt(6, u, y) < slack : w < .13 && shapeAt(7, u, y) < slack;
+}
+function pickPiece(ray) {
+  let best = Infinity, found = null;
+  for (const p of pieces) {
+    if (p.sq < 0) continue;
+    const ox = ray.o[0] - p.x, oy = ray.o[1] - p.y, oz = ray.o[2] - p.z;
+    const dx = ray.d[0], dy = ray.d[1], dz = ray.d[2];
+    const a = dx * dx + dz * dz, b = ox * dx + oz * dz, c = ox * ox + oz * oz - BODY_R * BODY_R;
+    const disc = b * b - a * c;
+    if (disc < 0) continue;
+    const root = Math.sqrt(disc);
+    let t0 = (-b - root) / a, t1 = (-b + root) / a;
+    const s0 = -oy / dy, s1 = (HEIGHTS[p.type - 1] - oy) / dy;
+    t0 = Math.max(t0, Math.min(s0, s1)); t1 = Math.min(t1, Math.max(s0, s1));
+    for (let t = t0; t < t1 && t < best; t += .03) {
+      if (solidAt(p, ox + dx * t, oy + dy * t, oz + dz * t)) { best = t; found = p; break; }
+    }
+  }
+  return found;
+}
+function boardPoint(ray) {
+  const t = -ray.o[1] / ray.d[1];
+  return [ray.o[0] + ray.d[0] * t, ray.o[2] + ray.d[2] * t];
+}
+function squareUnder(fx, fy) {
+  const ray = rayAt(fx, fy);
+  const p = pickPiece(ray);
+  const [x, z] = boardPoint(ray);
+  return { piece: p ? p.sq : -1, plane: worldSquare(x, z), x, z };
+}
+function pipUnder(x, z) {
+  for (let i = 0; i < 3; i++) if (Math.hypot(x - (2.42 + i * .62), z - 4.31) < .31) return i;
+  return -1;
+}
+
+let pointerX = -1, pointerY = -1;
+let hoverLabel = "";
+const PIECE_NAMES = ["", "PAWN", "KNIGHT", "BISHOP", "ROOK", "QUEEN", "KING"];
+function updateHover() {
+  if (pointerX < 0) return;
+  let next = -1;
+  const u = squareUnder(pointerX, pointerY);
+  const s = u.piece >= 0 ? u.piece : u.plane;
+  const under = s >= 0 ? pieceAt[s] : null;
+  const button = buttonAt(pointerX, pointerY);
+  if (button !== hoverButton) { hoverButton = button; textDirty = true; wake(); }
+  const pip = twoPlayer ? -1 : pipUnder(u.x, u.z);
+  const label = pip >= 0 ? "CLICK FOR " + LEVEL_NAMES[pip] + " LEVEL" : under ? (under.black ? "BLACK " : "WHITE ") + PIECE_NAMES[under.type] : "";
+  if (label !== hoverLabel) { hoverLabel = label; textDirty = true; wake(); }
+  if (humanTurn() && !gameOver && !thinking && !promo && under && under.black === rules.side) next = s;
+  if (next !== hovered) { hovered = next; setMarks(); }
+}
+
+function cellAt(fx, fy) { return [Math.floor(fx * W / cw), Math.floor(fy * H / ch)]; }
+function buttonAt(fx, fy) {
+  const [c, r] = cellAt(fx, fy);
+  const b = buttons.find(b => c >= b.col - 1 && c < b.col + b.w + 1 && r >= b.row - 1 && r < b.row + 3);
+  return b ? b.id : "";
+}
+function pressReset() {
+  if (!played.length && !gameOver) return;
+  if (gameOver || resetArmed > 0) { newGame(false); return; }
+  resetArmed = CFG.resetConfirm;
+  textDirty = true; wake();
+}
+function toggleMode() {
+  twoPlayer = !twoPlayer;
+  thinking = false; reply = null; requestId++;
+  selected = hovered = -1;
+  save(); setMarks();
+  if (!twoPlayer && !gameOver && !promo && !humanTurn()) askBot();
+}
+
+function click(fx, fy) {
+  const button = buttonAt(fx, fy);
+  if (button === "reset") { pressReset(); return; }
+  if (button === "mode") { toggleMode(); return; }
+  const u = squareUnder(fx, fy);
+  const onBoard = Math.max(Math.abs(u.x), Math.abs(u.z)) < BOARD_R;
+  const pip = pipUnder(u.x, u.z);
+  if (pip >= 0 && !twoPlayer) { level = pip; save(); textDirty = true; wake(); return; }
+
+  if (gameOver) {
+    if (overAge > 1.4 && onBoard) newGame();
+    return;
+  }
+  if (promo) {
+    if (u.piece === promo.to || u.plane === promo.to) cyclePromotion();
+    else { promo = null; afterMove(); }
+    return;
+  }
+  if (!humanTurn() || thinking) return;
+
+  // A legal destination wins over a piece that just happens to stand in front of it.
+  const pool = selected >= 0 ? rules.legal().filter(m => rules.fromOf(m) === selected) : [];
+  const dest = pool.some(m => rules.toOf(m) === u.piece) ? u.piece : (pool.some(m => rules.toOf(m) === u.plane) ? u.plane : -1);
+  if (dest >= 0) {
+    const options = pool.filter(m => rules.toOf(m) === dest);
+    chooseMove(options.find(m => rules.promoOf(m) === 5) || options[0]);
+    return;
+  }
+  const s = u.piece >= 0 ? u.piece : u.plane;
+  if (s >= 0 && pieceAt[s] && pieceAt[s].black === rules.side) {
+    selected = s === selected ? -1 : s;
+    if (pieceAt[s].type === 6) press = { sq: s, age: 0, x: fx, y: fy };
+  } else selected = -1;
+  setMarks();
+}
+
+// ---- animation ------------------------------------------------------------------
+let clock = 0, light = [0, 1, 0], pool = [0, 0];
+const marks = new Uint8Array(64 * 4), marksGoal = new Uint8Array(64 * 4);
+const dataA = new Float32Array(32 * 4), dataB = new Float32Array(32 * 4);
+let checkGlow = 0, checkX = 0, checkZ = 0;
+
+function statusText() {
+  const lvl = LEVEL_NAMES[level];
+  if (gameOver) {
+    const winner = gameOver.loser ? "WHITE" : "BLACK", quitter = gameOver.loser ? "BLACK" : "WHITE";
+    const word = { checkmate: twoPlayer ? "CHECKMATE - " + winner + " WINS" : gameOver.loser === humanSide() ? "CHECKMATE - YOU LOST" : "CHECKMATE - YOU WON", resign: twoPlayer ? quitter + " RESIGNED - " + winner + " WINS" : "YOU RESIGNED", stalemate: "STALEMATE - DRAW", fifty: "DRAW - 50 MOVES", repetition: "DRAW - REPETITION", material: "DRAW - NOT ENOUGH PIECES" }[gameOver.reason];
+    return word + (overAge > 1.4 ? "   -   CLICK THE BOARD FOR A NEW GAME" : "");
+  }
+  if (promo && pieceAt[promo.to]) return PROMO_NAMES[pieceAt[promo.to].type] + "   -   CLICK IT TO CHANGE";
+  if (press && press.age > .25) return "KEEP HOLDING TO RESIGN";
+  if (hoverLabel) return hoverLabel;
+  if (twoPlayer) return (rules.status().check ? "CHECK - " : "") + (rules.side ? "BLACK" : "WHITE") + " TO MOVE";
+  if (thinking) return lvl + "   -   THINKING";
+  return lvl + "   -   " + (rules.status().check ? "CHECK - YOUR MOVE" : "YOUR MOVE");
+}
+
+function putText(text, col, row, rgb) {
+  for (let i = 0; i < text.length; i++) {
+    const g = G[text[i]];
+    if (!g) continue;
+    for (let qy = 0; qy < 2; qy++) for (let qx = 0; qx < 2; qx++) {
+      const x = col + i * 2 + qx, y = row + qy;
+      if (x < 0 || x >= cols || y < 0 || y >= rows) continue;
+      const k = (y * cols + x) * 4;
+      overlay[k] = rgb[0]; overlay[k + 1] = rgb[1]; overlay[k + 2] = rgb[2]; overlay[k + 3] = g | (qx << 6) | (qy << 7);
+    }
+  }
+}
+
+function drawText() {
+  overlay.fill(0);
+  const text = status = statusText();
+  // Centred on the screen, below the board's nearest corner, with the buttons under it.
+  const row = Math.min(rows - 7, Math.round(rows * (1 - CFG.centerY) + (BOARD_R * Math.SQRT2 * Math.sin(CFG.elev * DEG) + .95) * scale / ch));
+  putText(text, Math.round(cols / 2 - text.length), row, [236, 196, 140]);
+  const labels = [
+    { id: "reset", text: resetArmed > 0 ? "[ CLICK AGAIN TO RESET ]" : "[ RESET ]" },
+    { id: "mode", text: twoPlayer ? "[ MODE: 2 PLAYERS ]" : "[ MODE: VS BOT ]" },
+  ];
+  const gap = 8, width = labels.reduce((n, b) => n + b.text.length * 2, 0) + gap;
+  let col = Math.round((cols - width) / 2);
+  buttons = labels.map(b => {
+    const button = { id: b.id, col, row: row + 3, w: b.text.length * 2 };
+    const lit = hoverButton === b.id || (b.id === "reset" && resetArmed > 0);
+    putText(b.text, col, button.row, lit ? [255, 232, 180] : [168, 118, 74]);
+    col += button.w + gap;
+    return button;
+  });
+  gl.bindTexture(gl.TEXTURE_2D, overlayTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, overlay);
+  textDirty = false;
+}
+
+// Returns true while anything is visibly moving.
+function step(dt) {
+  clock += dt;
+  let active = false;
+  const ease = (v, g, rate) => { const n = v + (g - v) * Math.min(1, dt * rate); if (Math.abs(g - n) < .002) return g; active = true; return n; };
+
+  yaw = ease(yaw, yawGoal, 9);
+
+  // The light swings slowly from side to side, and a warm pool wanders the board.
+  const a = clock * Math.PI * 2 / CFG.lightPeriod;
+  const az = 2.25 + .55 * Math.sin(a);
+  const up = .78 + .06 * Math.sin(a * .7 + 1);
+  const len = Math.hypot(Math.cos(az), up, Math.sin(az));
+  light = [Math.cos(az) / len, up / len, Math.sin(az) / len];
+  pool = [Math.sin(a * .8) * 3.2, Math.cos(a * .53 + .6) * 2.6];
+
+  for (const p of pieces) {
+    if (p.t < 1) {
+      p.t = Math.min(1, p.t + dt / p.dur);
+      const u = smooth(p.t);
+      p.x = mix(p.fx, p.tx, u); p.z = mix(p.fz, p.tz, u);
+      p.y = mix(p.fy, p.ty, u) + Math.sin(Math.PI * p.t) * p.hop;
+      active = true;
+    }
+    p.lift = ease(p.lift, p.liftGoal, 15);
+    const goal = p.tiltGoal;
+    if (p.tilt !== goal) {
+      // Tips slowly, then falls faster.
+      p.tilt = goal > p.tilt ? Math.min(goal, p.tilt + dt * (.5 + p.tilt * 3.2)) : Math.max(goal, p.tilt - dt * 4);
+      active = true;
+    }
+    p.glow = ease(p.glow, p.sq === selected && selected >= 0 ? 1 : 0, 12);
+  }
+
+  for (let i = 0; i < marks.length; i++) {
+    if (marks[i] !== marksGoal[i]) {
+      const d = marksGoal[i] - marks[i];
+      marks[i] += Math.abs(d) < 12 ? d : Math.sign(d) * 12;
+      marksMoved = true; active = true;
+    }
+  }
+
+  const inCheck = !gameOver && rules.inCheck() ? 1 : 0;
+  if (inCheck) { const [x, z] = squareWorld(rules.kings[rules.side >> 3]); checkX = x; checkZ = z; }
+  checkGlow = ease(checkGlow, inCheck, 8);
+
+  if (gameOver) {
+    const was = overAge;
+    overAge += dt;
+    if (was <= 1.4 && overAge > 1.4) textDirty = true;
+  }
+  if (resetArmed > 0 && (resetArmed -= dt) <= 0) { resetArmed = 0; textDirty = true; }
+  if (promo && (promo.age += dt) >= CFG.promoWait) { promo = null; afterMove(); }
+  if (press) {
+    press.age += dt;
+    const king = pieceAt[press.sq];
+    const wasShown = press.age - dt > .25;
+    if (!wasShown && press.age > .25) textDirty = true;
+    if (king) king.tiltGoal = press.age > .25 ? clamp((press.age - .25) / (CFG.resignHold - .25), 0, 1) * .3 : 0;
+    active = true;
+    if (press.age >= CFG.resignHold) {
+      press = null;
+      resigned = true;
+      selected = hovered = -1;
+      save(); checkGameEnd(); setMarks();
+    }
+  }
+  if (reply && clock - thinkStart >= CFG.minThink && !pieces.some(p => p.t < 1)) applyReply();
+  if (textDirty || thinking || reply || promo) active = active || textDirty || !!promo;
+  return active;
+}
+let marksMoved = true;
+
+function fillUniforms() {
+  pieces.forEach((p, i) => {
+    const mine = !!p.black === !humanWhite;
+    dataA.set([p.x, p.y + p.lift, p.z, (p.type - 1) + (p.black ? 10 : 0) + (mine ? 0 : 100)], i * 4);
+    // A falling king tips sideways across the screen, where its outline reads best.
+    dataB.set([p.tilt, .788, -.616, p.glow], i * 4);
+  });
+}
+
+function render() {
+  if (textDirty) drawText();
+  if (marksMoved) {
+    gl.bindTexture(gl.TEXTURE_2D, marksTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, marks);
+    marksMoved = false;
+  }
+  fillUniforms();
+  const b = basis();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, cols, rows);
+  gl.useProgram(sim.p);
+  gl.uniform2f(sim.u.uCellPx, cw, ch);
+  gl.uniform2f(sim.u.uCenter, cx, cy);
+  gl.uniform1f(sim.u.uScale, scale);
+  gl.uniform1f(sim.u.uT, clock);
+  gl.uniform3fv(sim.u.uR, b.R);
+  gl.uniform3fv(sim.u.uU, b.U);
+  gl.uniform3fv(sim.u.uF, b.F);
+  gl.uniform3fv(sim.u.uL, light);
+  gl.uniform2fv(sim.u.uPool, pool);
+  gl.uniform4fv(sim.u.uA, dataA);
+  gl.uniform4fv(sim.u.uB, dataB);
+  gl.uniform4f(sim.u.uCheck, checkX, checkZ, 0, checkGlow);
+  gl.uniform3f(sim.u.uPips, twoPlayer ? 0 : 1, !twoPlayer && level >= 1 ? 1 : 0, !twoPlayer && level >= 2 ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, profTex); gl.uniform1i(sim.u.uProf, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, marksTex); gl.uniform1i(sim.u.uMarks, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+  gl.bindTexture(gl.TEXTURE_2D, simTex);
+  gl.generateMipmap(gl.TEXTURE_2D);
+
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(draw.p);
+  gl.uniform1i(draw.u.uSim, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, overlayTex); gl.uniform1i(draw.u.uOverlay, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, atlasTex); gl.uniform1i(draw.u.uAtlas, 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, idTex); gl.uniform1i(draw.u.uIds, 3);
+  gl.uniform1i(draw.u.uCW, cw);
+  gl.uniform1i(draw.u.uCH, ch);
+  gl.uniform1i(draw.u.uH, H);
+  gl.uniform1i(draw.u.uGap, Math.max(1, Math.round((window.devicePixelRatio || 1) * .5)));
+  gl.uniform1i(draw.u.uRamp, RAMP.length);
+  gl.uniform2f(draw.u.uRes, W, H);
+  gl.uniform1f(draw.u.uGlow, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+// ---- loading a saved game --------------------------------------------------------
+function loadGame(data) {
+  rules.setup();
+  played = []; gameOver = null; promo = null; press = null; selected = hovered = -1; lastFrom = lastTo = -1; thinking = false; reply = null;
+  requestId++;
+  humanWhite = !data || data.white !== false;
+  twoPlayer = !!(data && data.two);
+  resetArmed = 0;
+  resigned = !!(data && data.resigned);
+  if (data && Number.isInteger(data.level)) level = clamp(data.level, 0, 2);
+  tableCount[0] = tableCount[1] = 0;
+  makePieces(); indexPieces();
+  for (const p of pieces) { const [x, z] = squareWorld(p.sq); place(p, x, 0, z); p.tilt = p.tiltGoal = 0; }
+  for (const text of (data && data.moves) || []) {
+    const m = rules.legal().find(x => rules.uci(x) === text);
+    if (m === undefined) break;
+    playMove(m, true);
+  }
+  checkGameEnd(true);
+  setMarks();
+  marks.set(marksGoal); marksMoved = true;
+  if (!gameOver && !humanTurn()) askBot();
+}
+function readSaved() {
+  try { return JSON.parse(localStorage.getItem(STORE)); } catch (e) { return null; }
+}
+addEventListener("storage", e => { if (e.key === STORE) loadGame(readSaved()); });
+
+// ---- host API (same shape as the other scenes) -----------------------------
+let paused = false, timer = 0, lastTick = 0, ticking = false;
+function wake() {
+  if (paused || !ticking) return;
+  clearTimeout(timer);
+  timer = setTimeout(tick, 0);
+}
+function tick() {
+  if (paused) return;
+  const now = performance.now();
+  const dt = Math.min(.25, (now - lastTick) / 1000);
+  lastTick = now;
+  const active = step(dt);
+  render();
+  ascii.frames = (ascii.frames || 0) + 1;
+  // Nothing is moving: fall back to a few redraws a second for the drifting light.
+  timer = setTimeout(tick, active ? 1000 / CFG.fps : 1000 / CFG.idleFps);
+}
+
+const ascii = window.ascii = {
+  pointer(x, y) {
+    if (press && Math.hypot(x - press.x, y - press.y) > .012) cancelPress();
+    pointerX = x; pointerY = y;
+    updateHover();
+  },
+  click(x, y) { pointerX = x; pointerY = y; click(x, y); },
+  release: cancelPress,
+  scroll(dy) { yawGoal = clamp(yawGoal - dy * CFG.orbitSpeed, CFG.yawMin, CFG.yawMax); wake(); },
+  setPaused(p) {
+    paused = p;
+    clearTimeout(timer);
+    if (!p) { lastTick = performance.now(); ticking = true; tick(); }
+  },
+  warp(seconds) { for (let i = 0; i < seconds * 30; i++) step(1 / 30); },
+  frame() { render(); return canvas.toDataURL("image/png"); },
+  // For testing.
+  state: () => ({ status, two: twoPlayer, armed: resetArmed > 0, over: gameOver && gameOver.reason, moves: played.slice(), turn: rules.side ? "b" : "w", human: humanWhite ? "w" : "b", level, thinking, selected, hovered, bot: botInfo, active: !!worker, yaw: +yaw.toFixed(1) }),
+  squareAt(name, height = 0) {
+    const s = (name.charCodeAt(0) - 97) | ((name.charCodeAt(1) - 49) << 4);
+    const [x, z] = squareWorld(s);
+    return screenOf([x, height, z]);
+  },
+  worldAt: (x, y, z) => screenOf([x, y, z]),
+  button(id) {
+    const b = buttons.find(x => x.id === id);
+    return { x: (b.col + b.w / 2) * cw / W, y: (b.row + 1) * ch / H };
+  },
+  load: loadGame,
+  fen: f => { rules.loadFen(f); },
+};
+function cancelPress() {
+  if (!press) return;
+  const king = pieceAt[press.sq];
+  if (king) king.tiltGoal = 0;
+  press = null;
+  textDirty = true;
+  wake();
+}
+
+addEventListener("pointermove", e => ascii.pointer(e.clientX / innerWidth, e.clientY / innerHeight));
+addEventListener("pointerdown", e => ascii.click(e.clientX / innerWidth, e.clientY / innerHeight));
+addEventListener("pointerup", () => ascii.release());
+addEventListener("wheel", e => ascii.scroll(e.deltaY), { passive: true });
+addEventListener("resize", resize);
+
+resize();
+makePieces();
+loadGame(readSaved());
+step(0);
+ticking = true;
+lastTick = performance.now();
+tick();
+</script>
+</body>
+</html>
