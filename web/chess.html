@@ -17,8 +17,8 @@
 const CFG = {
   fps: 30,           // while something is moving
   idleFps: 6,        // while the board just sits in its drifting light
-  cellW: 3,          // CSS px per character
-  cellH: 5,
+  cellW: 5,          // CSS px per character
+  cellH: 8,
   height: .95,       // how much of the screen height the board and pieces fill
   centerY: .46,      // where the board sits, from the bottom of the screen
   elev: 43,          // camera height above the table, degrees
@@ -29,9 +29,8 @@ const CFG = {
   moveTime: .34,     // seconds for a piece to travel
   captureTime: .62,
   minThink: .55,     // the bot never answers faster than this
-  resetConfirm: 3,   // seconds the reset button waits for its second click
   promoWait: 3,      // seconds to change a promoted piece before the bot replies
-  resignHold: 1.1,   // seconds holding your king to resign
+  kingHold: 1.1,     // seconds holding a king to resign (yours) or switch opponent (the other one)
   lightPeriod: 70,   // seconds for the light to swing across the board and back
   level: 1,          // 0 easy, 1 medium, 2 hard
 };
@@ -499,7 +498,7 @@ function chessEngine() {
 // ---- world layout ------------------------------------------------------------
 // Squares are one unit. x right, y up from the board's top, z toward the player.
 const BOARD_R = 4.62, TABLE_Y = -.62, BODY_R = .5;
-const HEIGHTS = [.92, 1.56, 1.87, 1.26, 1.99, 2.28];   // pawn knight bishop rook queen king
+const HEIGHTS = [.92, 1.56, 1.87, 1.26, 1.99, 2.36];   // pawn knight bishop rook queen king
 
 // ---- turned-wood piece shapes, baked into a small distance texture -----------
 const PW = 72, PH = 160, UR = .6, YR = 2.4, LAYERS = 8;
@@ -515,7 +514,7 @@ function taper(r, y, y0, y1, r0, r1) {
   return Math.max(Math.abs(r) - mix(r0, r1, t), Math.max(y0 - y, y - y1));
 }
 const foot = (r, y) => smin(rbox(r, y, .07, .33, .07, .03), rbox(r, y, .165, .26, .045, .03), .03);
-// A short head, a tall horse, a pointed mitre, a square tower, a spiked crown, a big cross.
+// A short head, a tall horse, a slim spike, a square tower, a big ball, a big cross.
 const HORSE = [[-.24, .34], [.2, .34], [.1, .55], [.0, .78], [.1, .8], [.34, .76], [.46, .83], [.47, .94], [.34, 1.06], [.2, 1.2], [.17, 1.3], [.1, 1.54], [.01, 1.34], [-.12, 1.3], [-.27, 1.1], [-.33, .86], [-.3, .58]];
 function polygon(x, y, pts) {
   let d = 1e9, s = 1;
@@ -532,12 +531,12 @@ function polygon(x, y, pts) {
 const SHAPES = [
   (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, .52, .17, .085), .035); d = smin(d, rbox(r, y, .5, .17, .025, .015), .012); return smin(d, circle(r, y, .69, .2), .015); },
   (r, y) => smin(foot(r, y), taper(r, y, .15, .42, .24, .2), .035),
-  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.05, .18, .075), .035); d = smin(d, rbox(r, y, 1.03, .19, .025, .015), .012); d = smin(d, oval(r, y, 1.38, .19, .36), .025); return smin(d, circle(r, y, 1.79, .065), .012); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.05, .18, .12), .035); d = smin(d, rbox(r, y, 1.03, .21, .03, .015), .012); return smin(d, taper(r, y, 1.05, 1.86, .25, .015), .02); },
   (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, .9, .2, .19), .03); d = smin(d, rbox(r, y, 1.02, .325, .2, .02), .02); return Math.max(d, -rbox(r, y, 1.24, .2, .09, .01)); },
-  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.25, .19, .075), .035); d = smin(d, rbox(r, y, 1.23, .2, .025, .015), .012); d = smin(d, taper(r, y, 1.25, 1.75, .11, .34), .02); return smin(d, circle(r, y, 1.86, .115), .02); },
-  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.38, .2, .085), .035); d = smin(d, rbox(r, y, 1.36, .22, .027, .015), .012); d = smin(d, taper(r, y, 1.38, 1.68, .1, .185), .02); d = smin(d, oval(r, y, 1.69, .195, .06), .015); return smin(d, rbox(r, y, 1.8, .085, .1, .02), .02); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.3, .19, .1), .035); d = smin(d, rbox(r, y, 1.28, .2, .025, .015), .012); return smin(d, circle(r, y, 1.6, .33), .02); },
+  (r, y) => { let d = smin(foot(r, y), taper(r, y, .15, 1.38, .2, .11), .035); d = smin(d, rbox(r, y, 1.36, .22, .027, .015), .012); d = smin(d, taper(r, y, 1.38, 1.68, .1, .185), .02); d = smin(d, oval(r, y, 1.69, .195, .06), .015); return smin(d, rbox(r, y, 1.8, .085, .1, .02), .02); },
   (u, y) => polygon(u, y, HORSE) - .012,
-  (u, y) => Math.min(rbox(u, y, 1.99, .072, .29, .012), rbox(u, y, 2.0, .225, .068, .012)),
+  (u, y) => Math.min(rbox(u, y, 1.99, .13, .37, .012), rbox(u, y, 1.9, .4, .12, .012)),
 ];
 const profileData = new Float32Array(PW * PH * LAYERS);
 SHAPES.forEach((fn, layer) => {
@@ -564,7 +563,7 @@ uniform vec4 uB[32];    // x tilt angle, yz tilt direction, w glow
 uniform sampler2DArray uProf;
 uniform sampler2D uMarks;  // per square: dot, capture ring, selection, last move
 uniform vec4 uCheck;       // xz square, w strength
-uniform vec3 uPips;        // brightness of the three level pips
+uniform vec4 uPips;        // xyz brightness of the three level pips, w the bot light strip
 layout(location=0) out vec4 o;
 layout(location=1) out vec4 oId;   // which object this character shows, and how far away
 
@@ -596,15 +595,8 @@ float pieceD(vec3 p,int t,float hd){
     float u=dot(p.xz,a), w=dot(p.xz,vec2(-a.y,a.x));
     float s2=prof(u,y,6.);
     d=min(d,slab(s2,w,mix(.17,.1,smoothstep(.55,1.3,y))*(.55+.45*smoothstep(.0,-.15,s2)))-.008);
-  } else if(t==2){
-    if(y>1.38 && p.x>.0) d=max(d,-(abs(p.x*.72+(y-1.64)*.69)-.032));
   } else if(t==3){
     if(y>1.02){ vec2 q=abs(vec2(p.x+p.z,p.x-p.z))*.7071; d=max(d,.1-min(q.x,q.y)); }
-  } else if(t==4){
-    if(r>.12 && y>1.42){
-      float a=atan(p.z,p.x), v=pow(abs(cos(a*3.)),3.);
-      d=max(d,(y-(1.42+.36*v))*.7);
-    }
   } else if(t==5){
     vec2 a=vec2(.788,-.616);
     d=min(d,slab(prof(dot(p.xz,a),y,7.),dot(p.xz,vec2(-a.y,a.x)),.075)-.008);
@@ -689,8 +681,8 @@ vec3 shadeBoardTop(vec3 p,vec3 rd,float sh,out float dens){
     vec3 mark=dark?vec3(1.,.6,.14):vec3(.58,.2,.03);
     if(m.r>.002) col=mix(col,mark,min(1.,m.r*1.5)*smoothstep(.235,.17,dc));
     if(m.g>.002) col=mix(col,mark,min(1.,m.g*1.5)*smoothstep(.08,.035,abs(dc-.4)));
-    dens=dark?.16+.34*grain:.56+.4*grain;
-    dens*=mix(.62,1.,sh);
+    dens=dark?.11+.16*grain:.56+.4*grain;
+    dens=max(dens*mix(.62,1.,sh),dark?.11:.3);
     if(m.r>.002 && dc<.2) dens=.95;
   } else {
     // the wooden rim round the squares
@@ -701,16 +693,22 @@ vec3 shadeBoardTop(vec3 p,vec3 rd,float sh,out float dens){
     col=mix(vec3(.13,.05,.015),col,groove)*lit;
     float outer=smoothstep(.0,.09,R-ax);
     col*=.45+.55*outer;
-    dens=.18+.5*grain;
+    dens=.44+.34*grain;
     // Level pips, set into the rim on the player's side.
     for(int i=0;i<3;i++){
       float d=distance(q,vec2(2.42+float(i)*.62,4.31));
       if(d<.27){
         float b=i==0?uPips.x:(i==1?uPips.y:uPips.z);
-        col=mix(vec3(.1,.05,.02),mix(vec3(.22,.13,.07),vec3(1.,.6,.14),b),smoothstep(.23,.18,d));
+        col=mix(vec3(.1,.05,.02),mix(vec3(.22,.13,.07),vec3(1.,.84,.46),b),smoothstep(.23,.18,d));
         dens=.3+.65*b;
       }
     }
+    // Bot light: a strip set into the rim on the player's right, lit while playing the bot.
+    float sd=length(vec2(q.x-4.31,max(abs(q.y)-3.75,0.)));
+    col+=uPips.w*vec3(1.,.55,.18)*.3*smoothstep(.42,.08,sd);
+    float strip=smoothstep(.125,.075,sd);
+    col=mix(col,mix(vec3(.09,.05,.025),vec3(1.,.84,.46),uPips.w),strip);
+    dens=mix(dens,.3+.65*uPips.w,strip);
   }
   return col;
 }
@@ -740,8 +738,8 @@ vec3 shadePiece(vec3 p,vec3 lp,vec3 rd,int t,float black,float hd,int self,vec4 
   float spec=pow(max(dot(n,h),0.),18.)*sh;
   float ndv=clamp(dot(n,-rd),0.,1.);
   float rim=smoothstep(.0,.42,ndv);
-  vec3 base=black>.5?vec3(.62,.31,.15):vec3(.98,.94,.86);
-  vec3 cool=black>.5?vec3(.13,.05,.03):vec3(.36,.34,.38);
+  vec3 base=black>.5?vec3(.17,.42,.25):vec3(.98,.94,.86);
+  vec3 cool=black>.5?vec3(.02,.08,.045):vec3(.36,.34,.38);
   float form=clamp(dl*1.15+wrap*wrap*.3-.04,0.,1.);
   vec3 col=mix(cool,base,form);
   // The turned grooves sit in shade, so collars and heads stand apart.
@@ -881,24 +879,20 @@ void main(){
   ivec2 sz=textureSize(uSim,0);
   ivec2 sc=ivec2(c.x,sz.y-1-c.y);
   vec4 d=texelFetch(uSim,sc,0);
-  // A dark outline on the nearer object wherever two objects meet.
+  // A dark outline round every piece, on whatever is behind it, so the piece keeps all its letters.
   vec4 me=texelFetch(uIds,sc,0);
   bool edge=false;
-  if(me.r>0.){
-    for(int i=0;i<4;i++){
-      ivec2 n=clamp(sc+(i==0?ivec2(1,0):i==1?ivec2(-1,0):i==2?ivec2(0,1):ivec2(0,-1)),ivec2(0),sz-1);
-      vec4 v=texelFetch(uIds,n,0);
-      if(abs(v.r-me.r)>.001 && me.g<=v.g+.0005) edge=true;
-    }
+  for(int i=0;i<4;i++){
+    ivec2 n=clamp(sc+(i==0?ivec2(1,0):i==1?ivec2(-1,0):i==2?ivec2(0,1):ivec2(0,-1)),ivec2(0),sz-1);
+    vec4 v=texelFetch(uIds,n,0);
+    if(v.r*255.>1.5 && abs(v.r-me.r)>.001 && me.g>=v.g-.0005) edge=true;
   }
   vec4 ov=texelFetch(uOverlay,c,0);
   bool inside=s.x<uCW-uGap && s.y<uCH-uGap;
   vec3 col;
   int oa=int(ov.a*255.+.5);
   if(oa!=0){
-    // Each letter spans two by two characters; the top bits say which quarter this is.
-    ivec2 q=ivec2((oa>>6)&1,(oa>>7)&1);
-    float ink=texelFetch(uAtlas,ivec2((oa&63)*uCW+(q.x*uCW+s.x)/2,(q.y*uCH+s.y)/2),0).r;
+    float ink=texelFetch(uAtlas,ivec2(oa*uCW+s.x,s.y),0).r;
     col=mix(d.rgb,ov.rgb,ink);
   } else if(edge){
     col=inside?vec3(.09,.04,.022):vec3(.05,.022,.012);
@@ -906,7 +900,7 @@ void main(){
     int g=clamp(int(d.a*float(uRamp-1))+1,1,uRamp-1);
     if(me.b>0.) g=int(me.b*255.+.5);   // a piece is drawn with its own letter
     float ink=texelFetch(uAtlas,ivec2(g*uCW+s.x,s.y),0).r;
-    float ground=me.r==0.?.62:(me.b>0.?.6:.46);
+    float ground=me.r==0.?.62:(me.b>0.?(me.r*255.>17.5?.4:.6):.46);
     col=mix(d.rgb*ground,min(vec3(1.),d.rgb*(me.r==0.?1.3:1.5)+.03),ink);
   } else col=d.rgb;
   vec2 uv=gl_FragCoord.xy/uRes;
@@ -984,7 +978,7 @@ function resize() {
   overlay = new Uint8Array(cols * rows * 4);
   // Fit the board, its rim, and the tallest pieces, at the widest camera angle.
   const span = 2 * BOARD_R * Math.SQRT2;
-  scale = Math.min(H * CFG.height / (span * Math.sin(CFG.elev * DEG) + 3), W * .72 / (span + 3));
+  scale = Math.min(H * CFG.height / (span * Math.sin(CFG.elev * DEG) + 3), W * .9 / (span + 3));
   cx = W / 2; cy = rows * ch * CFG.centerY;
   gl.bindTexture(gl.TEXTURE_2D, simTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
@@ -1023,7 +1017,6 @@ const rules = chessEngine();
 const STORE = "ascii-chess";
 const STILL_MOVES = ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "d2d3", "g8f6", "c1g5", "d7d6", "b1c3", "c8g4", "d1d2", "d8d7"];
 let humanWhite = true, twoPlayer = false, level = clamp(CFG.level, 0, 2), played = [], resigned = false;
-let buttons = [], hoverButton = "", resetArmed = 0;
 let pieces = [], pieceAt = new Array(128).fill(null);
 let selected = -1, hovered = -1, targets = [], lastFrom = -1, lastTo = -1;
 let gameOver = null, overAge = 0, thinking = false, thinkStart = 0, requestId = 0, reply = null;
@@ -1178,11 +1171,10 @@ function cyclePromotion() {
   save(); wake();
 }
 
-function newGame(swapSides = true) {
+function newGame() {
   rules.setup();
   played = []; resigned = false; gameOver = null; promo = null; press = null; selected = hovered = -1; lastFrom = lastTo = -1;
-  if (swapSides && !twoPlayer) humanWhite = !humanWhite;
-  resetArmed = 0;
+  if (!twoPlayer) humanWhite = !humanWhite;
   tableCount[0] = tableCount[1] = 0;
   for (const p of pieces) {
     p.type = p.homeType; p.sq = p.home; p.tiltGoal = 0;
@@ -1293,39 +1285,33 @@ function updateHover() {
   const u = squareUnder(pointerX, pointerY);
   const s = u.piece >= 0 ? u.piece : u.plane;
   const under = s >= 0 ? pieceAt[s] : null;
-  const button = buttonAt(pointerX, pointerY);
-  if (button !== hoverButton) { hoverButton = button; textDirty = true; wake(); }
   const pip = twoPlayer ? -1 : pipUnder(u.x, u.z);
-  const label = pip >= 0 ? "CLICK FOR " + LEVEL_NAMES[pip] + " LEVEL" : under ? (under.black ? "BLACK " : "WHITE ") + PIECE_NAMES[under.type] : "";
+  const hold = kingHoldKind(under);
+  const hint = hold === "resign" ? "   -   HOLD TO RESIGN" : hold === "switch" ? "   -   HOLD TO PLAY " + (twoPlayer ? "THE BOT" : "A FRIEND") : "";
+  const label = pip >= 0 ? "CLICK FOR " + LEVEL_NAMES[pip] + " LEVEL" : under ? (under.black ? "BLACK " : "WHITE ") + PIECE_NAMES[under.type] + hint : "";
   if (label !== hoverLabel) { hoverLabel = label; textDirty = true; wake(); }
   if (humanTurn() && !gameOver && !thinking && !promo && under && under.black === rules.side) next = s;
   if (next !== hovered) { hovered = next; setMarks(); }
 }
 
-function cellAt(fx, fy) { return [Math.floor(fx * W / cw), Math.floor(fy * H / ch)]; }
-function buttonAt(fx, fy) {
-  const [c, r] = cellAt(fx, fy);
-  const b = buttons.find(b => c >= b.col - 1 && c < b.col + b.w + 1 && r >= b.row - 1 && r < b.row + 3);
-  return b ? b.id : "";
-}
-function pressReset() {
-  if (!played.length && !gameOver) return;
-  if (gameOver || resetArmed > 0) { newGame(false); return; }
-  resetArmed = CFG.resetConfirm;
-  textDirty = true; wake();
+// What holding this piece down would do. The king of the side that isn't yours
+// (or, with two players, the side not moving) switches opponent; your own resigns.
+function kingHoldKind(p) {
+  if (!p || p.type !== 6 || gameOver || promo) return "";
+  if (p.black !== (twoPlayer ? rules.side : humanSide())) return "switch";
+  return humanTurn() && !thinking ? "resign" : "";
 }
 function toggleMode() {
   twoPlayer = !twoPlayer;
   thinking = false; reply = null; requestId++;
   selected = hovered = -1;
   save(); setMarks();
+  updateHover();
+  textDirty = true; wake();
   if (!twoPlayer && !gameOver && !promo && !humanTurn()) askBot();
 }
 
 function click(fx, fy) {
-  const button = buttonAt(fx, fy);
-  if (button === "reset") { pressReset(); return; }
-  if (button === "mode") { toggleMode(); return; }
   const u = squareUnder(fx, fy);
   const onBoard = Math.max(Math.abs(u.x), Math.abs(u.z)) < BOARD_R;
   const pip = pipUnder(u.x, u.z);
@@ -1340,10 +1326,10 @@ function click(fx, fy) {
     else { promo = null; afterMove(); }
     return;
   }
-  if (!humanTurn() || thinking) return;
+  const canMove = humanTurn() && !thinking;
 
   // A legal destination wins over a piece that just happens to stand in front of it.
-  const pool = selected >= 0 ? rules.legal().filter(m => rules.fromOf(m) === selected) : [];
+  const pool = canMove && selected >= 0 ? rules.legal().filter(m => rules.fromOf(m) === selected) : [];
   const dest = pool.some(m => rules.toOf(m) === u.piece) ? u.piece : (pool.some(m => rules.toOf(m) === u.plane) ? u.plane : -1);
   if (dest >= 0) {
     const options = pool.filter(m => rules.toOf(m) === dest);
@@ -1351,10 +1337,11 @@ function click(fx, fy) {
     return;
   }
   const s = u.piece >= 0 ? u.piece : u.plane;
-  if (s >= 0 && pieceAt[s] && pieceAt[s].black === rules.side) {
-    selected = s === selected ? -1 : s;
-    if (pieceAt[s].type === 6) press = { sq: s, age: 0, x: fx, y: fy };
-  } else selected = -1;
+  const hold = s >= 0 ? kingHoldKind(pieceAt[s]) : "";
+  if (hold) press = { sq: s, age: 0, x: fx, y: fy, hold };
+  if (!canMove) return;
+  if (s >= 0 && pieceAt[s] && pieceAt[s].black === rules.side) selected = s === selected ? -1 : s;
+  else selected = -1;
   setMarks();
 }
 
@@ -1362,7 +1349,7 @@ function click(fx, fy) {
 let clock = 0, light = [0, 1, 0], pool = [0, 0];
 const marks = new Uint8Array(64 * 4), marksGoal = new Uint8Array(64 * 4);
 const dataA = new Float32Array(32 * 4), dataB = new Float32Array(32 * 4);
-let checkGlow = 0, checkX = 0, checkZ = 0;
+let checkGlow = 0, checkX = 0, checkZ = 0, botLight = 1;
 
 function statusText() {
   const lvl = LEVEL_NAMES[level];
@@ -1372,7 +1359,7 @@ function statusText() {
     return word + (overAge > 1.4 ? "   -   CLICK THE BOARD FOR A NEW GAME" : "");
   }
   if (promo && pieceAt[promo.to]) return PROMO_NAMES[pieceAt[promo.to].type] + "   -   CLICK IT TO CHANGE";
-  if (press && press.age > .25) return "KEEP HOLDING TO RESIGN";
+  if (press && press.age > .25) return "KEEP HOLDING TO " + (press.hold === "resign" ? "RESIGN" : "PLAY " + (twoPlayer ? "THE BOT" : "A FRIEND"));
   if (hoverLabel) return hoverLabel;
   if (twoPlayer) return (rules.status().check ? "CHECK - " : "") + (rules.side ? "BLACK" : "WHITE") + " TO MOVE";
   if (thinking) return lvl + "   -   THINKING";
@@ -1383,34 +1370,19 @@ function putText(text, col, row, rgb) {
   for (let i = 0; i < text.length; i++) {
     const g = G[text[i]];
     if (!g) continue;
-    for (let qy = 0; qy < 2; qy++) for (let qx = 0; qx < 2; qx++) {
-      const x = col + i * 2 + qx, y = row + qy;
-      if (x < 0 || x >= cols || y < 0 || y >= rows) continue;
-      const k = (y * cols + x) * 4;
-      overlay[k] = rgb[0]; overlay[k + 1] = rgb[1]; overlay[k + 2] = rgb[2]; overlay[k + 3] = g | (qx << 6) | (qy << 7);
-    }
+    const x = col + i;
+    if (x < 0 || x >= cols || row < 0 || row >= rows) continue;
+    const k = (row * cols + x) * 4;
+    overlay[k] = rgb[0]; overlay[k + 1] = rgb[1]; overlay[k + 2] = rgb[2]; overlay[k + 3] = g;
   }
 }
 
 function drawText() {
   overlay.fill(0);
   const text = status = statusText();
-  // Centred on the screen, below the board's nearest corner, with the buttons under it.
-  const row = Math.min(rows - 7, Math.round(rows * (1 - CFG.centerY) + (BOARD_R * Math.SQRT2 * Math.sin(CFG.elev * DEG) + .95) * scale / ch));
-  putText(text, Math.round(cols / 2 - text.length), row, [236, 196, 140]);
-  const labels = [
-    { id: "reset", text: resetArmed > 0 ? "[ CLICK AGAIN TO RESET ]" : "[ RESET ]" },
-    { id: "mode", text: twoPlayer ? "[ MODE: 2 PLAYERS ]" : "[ MODE: VS BOT ]" },
-  ];
-  const gap = 8, width = labels.reduce((n, b) => n + b.text.length * 2, 0) + gap;
-  let col = Math.round((cols - width) / 2);
-  buttons = labels.map(b => {
-    const button = { id: b.id, col, row: row + 3, w: b.text.length * 2 };
-    const lit = hoverButton === b.id || (b.id === "reset" && resetArmed > 0);
-    putText(b.text, col, button.row, lit ? [255, 232, 180] : [168, 118, 74]);
-    col += button.w + gap;
-    return button;
-  });
+  // Centred on the screen, below the board's nearest corner.
+  const row = Math.min(rows - 3, Math.round(rows * (1 - CFG.centerY) + (BOARD_R * Math.SQRT2 * Math.sin(CFG.elev * DEG) + .6) * scale / ch));
+  putText(text, Math.round((cols - text.length) / 2), row, [236, 196, 140]);
   gl.bindTexture(gl.TEXTURE_2D, overlayTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, overlay);
   textDirty = false;
@@ -1461,29 +1433,36 @@ function step(dt) {
   const inCheck = !gameOver && rules.inCheck() ? 1 : 0;
   if (inCheck) { const [x, z] = squareWorld(rules.kings[rules.side >> 3]); checkX = x; checkZ = z; }
   checkGlow = ease(checkGlow, inCheck, 8);
+  botLight = ease(botLight, twoPlayer ? 0 : 1, 7);
 
   if (gameOver) {
     const was = overAge;
     overAge += dt;
     if (was <= 1.4 && overAge > 1.4) textDirty = true;
   }
-  if (resetArmed > 0 && (resetArmed -= dt) <= 0) { resetArmed = 0; textDirty = true; }
   if (promo && (promo.age += dt) >= CFG.promoWait) { promo = null; afterMove(); }
   if (press) {
     press.age += dt;
     const king = pieceAt[press.sq];
     const wasShown = press.age - dt > .25;
     if (!wasShown && press.age > .25) textDirty = true;
-    if (king) king.tiltGoal = press.age > .25 ? clamp((press.age - .25) / (CFG.resignHold - .25), 0, 1) * .3 : 0;
+    if (king) king.tiltGoal = press.age > .25 ? clamp((press.age - .25) / (CFG.kingHold - .25), 0, 1) * .3 : 0;
     active = true;
-    if (press.age >= CFG.resignHold) {
+    if (press.age >= CFG.kingHold) {
+      const hold = press.hold;
       press = null;
-      resigned = true;
-      selected = hovered = -1;
-      save(); checkGameEnd(); setMarks();
+      if (hold === "resign") {
+        resigned = true;
+        selected = hovered = -1;
+        save(); checkGameEnd(); setMarks();
+      } else {
+        if (king) king.tiltGoal = 0;
+        toggleMode();
+      }
     }
   }
-  if (reply && clock - thinkStart >= CFG.minThink && !pieces.some(p => p.t < 1)) applyReply();
+  // The bot waits while a king is held, so it can't move the king out from under you.
+  if (reply && !press && clock - thinkStart >= CFG.minThink && !pieces.some(p => p.t < 1)) applyReply();
   if (textDirty || thinking || reply || promo) active = active || textDirty || !!promo;
   return active;
 }
@@ -1523,7 +1502,7 @@ function render() {
   gl.uniform4fv(sim.u.uA, dataA);
   gl.uniform4fv(sim.u.uB, dataB);
   gl.uniform4f(sim.u.uCheck, checkX, checkZ, 0, checkGlow);
-  gl.uniform3f(sim.u.uPips, twoPlayer ? 0 : 1, !twoPlayer && level >= 1 ? 1 : 0, !twoPlayer && level >= 2 ? 1 : 0);
+  gl.uniform4f(sim.u.uPips, twoPlayer ? 0 : 1, !twoPlayer && level >= 1 ? 1 : 0, !twoPlayer && level >= 2 ? 1 : 0, botLight);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, profTex); gl.uniform1i(sim.u.uProf, 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, marksTex); gl.uniform1i(sim.u.uMarks, 1);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -1557,7 +1536,7 @@ function loadGame(data) {
   requestId++;
   humanWhite = !data || data.white !== false;
   twoPlayer = !!(data && data.two);
-  resetArmed = 0;
+  botLight = twoPlayer ? 0 : 1;
   resigned = !!(data && data.resigned);
   if (data && Number.isInteger(data.level)) level = clamp(data.level, 0, 2);
   tableCount[0] = tableCount[1] = 0;
@@ -1638,17 +1617,13 @@ const ascii = window.ascii = {
     return png;
   },
   // For testing.
-  state: () => ({ status, two: twoPlayer, armed: resetArmed > 0, over: gameOver && gameOver.reason, moves: played.slice(), turn: rules.side ? "b" : "w", human: humanWhite ? "w" : "b", level, thinking, selected, hovered, bot: botInfo, active: !!worker, yaw: +yaw.toFixed(1) }),
+  state: () => ({ status, two: twoPlayer, over: gameOver && gameOver.reason, moves: played.slice(), turn: rules.side ? "b" : "w", human: humanWhite ? "w" : "b", level, thinking, selected, hovered, bot: botInfo, active: !!worker, yaw: +yaw.toFixed(1) }),
   squareAt(name, height = 0) {
     const s = (name.charCodeAt(0) - 97) | ((name.charCodeAt(1) - 49) << 4);
     const [x, z] = squareWorld(s);
     return screenOf([x, height, z]);
   },
   worldAt: (x, y, z) => screenOf([x, y, z]),
-  button(id) {
-    const b = buttons.find(x => x.id === id);
-    return { x: (b.col + b.w / 2) * cw / W, y: (b.row + 1) * ch / H };
-  },
   load: loadGame,
   fen: f => { rules.loadFen(f); },
 };

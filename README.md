@@ -25,10 +25,9 @@ While it's burning, a burst of quick clicks adds 10 minutes. Pressing and holdin
 A full game of chess with all the rules, including castling, en passant, promotion and the draw rules. Games are saved, so they survive switching wallpapers and restarting the app.
 
 - **Bot levels:** click one of the three round pips on the rim near the board's bottom corner for Easy, Medium or Hard. The bot runs in a background worker only on its own turn, for at most about a second.
-- **[ RESET ]:** click twice within 3 seconds to restart the game.
-- **[ MODE ]:** switches between playing the bot and two players sharing the mouse. The position is kept.
 - **Promotion:** a pawn becomes a queen, and you have 3 seconds to click it to change to a rook, bishop or knight.
-- **Resign:** hold your king for about a second.
+- **Resign:** hold your king for about a second. With two players, the side to move holds theirs.
+- **Bot or friend:** hold the other king for about a second to switch between playing the bot and two players sharing the mouse. The position is kept. A line of light on the board's right-hand rim is on while you're playing the bot.
 - **After a game:** the losing king topples. Click the board for a new game, with colours swapped when playing the bot.
 
 ## Build and run
