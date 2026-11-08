@@ -16,10 +16,10 @@
 // ---- tunables -------------------------------------------------------------
 const CFG = {
   fps: 30,
-  cellW: 4,          // CSS px per character
-  cellH: 6,
+  cellW: 7,          // CSS px per character
+  cellH: 10,
   fireWidth: .1155,  // one world unit, as a fraction of screen width
-  floorY: .25,       // height of the hearth above the bottom of the screen
+  floorY: .17,       // height of the hearth above the bottom of the screen
   strikes: 6,        // clicks needed, in quick succession, to light it
   grow: 55,          // seconds from first flame to full fire
   burn: 3600,        // seconds it burns once fully grown
@@ -29,11 +29,15 @@ const CFG = {
   burnLow: .8,       // while burning, size wanders between this and 100%
   fade: 110,         // seconds to die back down
   stillSeed: 7,      // which fire the lock screen shows
+  fireflies: 28,     // how many drift around the clearing
+  flyDrift: .06,     // their calm top speed, in screen heights per second
+  flyFlee: .55,      // how much faster a frightened one can go
+  flyAvoid: .2,      // how close the cursor gets before they scatter, in screen heights
 };
 for (const [k, v] of new URLSearchParams(location.search)) if (k in CFG) CFG[k] = +v;
 
 const RAMP = " .:;i!*%S#@";
-const GLYPHS = RAMP + "'";
+const GLYPHS = RAMP + "'\u25CF\u2022";
 const G = Object.fromEntries([...GLYPHS].map((c, i) => [c, i]));
 
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -77,8 +81,8 @@ const vec3 LB[NL]=vec3[NL](${vec3s(l => l.b)});
 const float LR[NL]=float[NL](${LOGS.map(l => l.r.toFixed(3)).join(",")});
 const float LS[NL]=float[NL](${LOGS.map(l => l.s.toFixed(1)).join(",")});
 
-const vec3 BOXMIN=vec3(-1.55,-.05,-1.1), BOXMAX=vec3(1.55,2.75,1.15);
-const float HMAX=2.2;
+const vec3 BOXMIN=vec3(-1.55,-.05,-1.1), BOXMAX=vec3(1.55,3.4,1.15);
+const float HMAX=2.7;
 
 float h21(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
 float vn(vec2 p){
@@ -438,6 +442,8 @@ let T = 0, flick = 1, wind = 0, windGoal = 0;
 let phase = "out", phaseAge = 0, level = 0, embers = 0, charge = 0, flash = 0;
 let burnLeft = 0, surge = 0, press = null;
 const sparks = [];
+const flies = [], mouse = { x: -1, y: -1 };   // mouse in screen heights from the top-left
+let fliesOn = true;
 const cursor = { x: -1 };
 const noise1 = x => {
   const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
@@ -489,7 +495,7 @@ function stepTongues(dt) {
     if ((t.age += dt) >= t.life) respawn(t);
     const u = t.age / t.life;
     const h = i < active && level > 0
-      ? 1.95 * t.size * t.short * (1 - .6 * Math.pow(Math.abs(t.root[0]), 1.5)) * Math.pow(Math.sin(Math.PI * u), .6) * grow
+      ? 2.4 * t.size * t.short * (1 - .6 * Math.pow(Math.abs(t.root[0]), 1.5)) * Math.pow(Math.sin(Math.PI * u), .6) * grow
       : 0;
     rootData.set([t.root[0], t.root[1], t.root[2], h], i * 4);
     tongData.set([t.wide, t.leanX + wind * -.25, t.leanZ, t.phase], i * 4);
@@ -583,6 +589,7 @@ function step(dt, clockDt = dt) {
   advanceClock(clockDt);
 
   stepTongues(dt);
+  if (fliesOn) stepFlies(dt);
 
   if (Math.random() < level * 17 * dt) {
     const p = pointOnWood();
@@ -606,6 +613,72 @@ function putOverlay(x, y, c, glyph) {
   overlay[i + 1] = Math.min(255, c[1] * 255);
   overlay[i + 2] = Math.min(255, c[2] * 255);
   overlay[i + 3] = glyph;
+}
+
+// Where fireflies may fly, in screen heights from the top-left: inside the frame, below
+// the menu bar, and outside a shape round the logs that narrows up to the flame tips.
+function flyBounds() {
+  const aspect = W / H, u = aspect * CFG.fireWidth, floor = 1 - CFG.floorY;
+  return { minX: .02, maxX: aspect - .02, minY: .05, maxY: .975, cx: aspect / 2, top: floor - 3 * u, neck: floor - .55 * u, bottom: Math.min(.955, floor + .62 * u), wide: 1.6 * u + .02, tip: .55 * u + .02 };
+}
+function fireHalfWidth(b, y) { return y >= b.neck ? b.wide : b.tip + (b.wide - b.tip) * (y - b.top) / (b.neck - b.top); }
+function inFire(b, x, y) { return y > b.top && y < b.bottom && Math.abs(x - b.cx) < fireHalfWidth(b, y); }
+function outOfFrame(b, x, y) { return x < b.minX || x > b.maxX || y < b.minY || y > b.maxY; }
+
+function stepFlies(dt) {
+  const b = flyBounds();
+  for (const f of flies) {
+    let ax = (noise1(f.seed + T * .35) - .5) * .35, ay = (noise1(f.seed + 70 + T * .35) - .5) * .35;
+    // Turn back before reaching the edges or the fire.
+    if (f.x < b.minX + .05) ax += (b.minX + .05 - f.x) * 4;
+    if (f.x > b.maxX - .05) ax -= (f.x - b.maxX + .05) * 4;
+    if (f.y < b.minY + .05) ay += (b.minY + .05 - f.y) * 4;
+    if (f.y > b.maxY - .05) ay -= (f.y - b.maxY + .05) * 4;
+    if (inFire(b, f.x, f.y - .06) || inFire(b, f.x - .06, f.y) || inFire(b, f.x + .06, f.y)) {
+      ax += Math.sign(f.x - b.cx || 1) * .5; ay -= .15;
+    }
+    f.fright *= Math.exp(-dt * 1.6);
+    if (mouse.x >= 0) {
+      const mx = f.x - mouse.x, my = f.y - mouse.y, d = Math.hypot(mx, my) || 1e-3;
+      if (d < CFG.flyAvoid) {
+        const k = 1 - d / CFG.flyAvoid;
+        let ux = mx / d, uy = my / d;
+        // Pinned against an edge: run along it instead of pushing into it.
+        const wallX = (f.x <= b.minX + .03 && ux < 0) || (f.x >= b.maxX - .03 && ux > 0);
+        const wallY = (f.y <= b.minY + .03 && uy < 0) || (f.y >= b.maxY - .03 && uy > 0);
+        if (wallX && wallY) { ux = Math.sign(b.cx - f.x || 1); uy = 0; }
+        else if (wallX) { ux = 0; uy = Math.sign(uy || f.seed - 450); }
+        else if (wallY) { uy = 0; ux = Math.sign(ux || f.seed - 450); }
+        ax += ux * k * k * 9; ay += uy * k * k * 9;
+        f.fright = Math.max(f.fright, k);
+      }
+    }
+    const damp = Math.exp(-dt * .9);
+    f.vx = (f.vx + ax * dt) * damp; f.vy = (f.vy + ay * dt) * damp;
+    const limit = CFG.flyDrift + f.fright * CFG.flyFlee, speed = Math.hypot(f.vx, f.vy);
+    if (speed > limit) { f.vx *= limit / speed; f.vy *= limit / speed; }
+    f.x += f.vx * dt; f.y += f.vy * dt;
+    // Nothing above can carry one past these limits.
+    if (inFire(b, f.x, f.y)) {
+      const side = fireHalfWidth(b, f.y) - Math.abs(f.x - b.cx), up = f.y - b.top, down = b.bottom - f.y;
+      if (side <= up && side <= down) { f.x = b.cx + Math.sign(f.x - b.cx || 1) * fireHalfWidth(b, f.y); f.vx = 0; }
+      else if (up <= down) { f.y = b.top; f.vy = 0; }
+      else { f.y = b.bottom; f.vy = 0; }
+    }
+    if (f.x < b.minX) { f.x = b.minX; f.vx = 0; } else if (f.x > b.maxX) { f.x = b.maxX; f.vx = 0; }
+    if (f.y < b.minY) { f.y = b.minY; f.vy = 0; } else if (f.y > b.maxY) { f.y = b.maxY; f.vy = 0; }
+  }
+}
+
+function drawFlies() {
+  for (const f of flies) {
+    // Each one glows and fades on its own rhythm, and flares when startled.
+    const pulse = Math.max(0, Math.sin(T * f.rate + f.seed)) ** 2;
+    const b = clamp(.22 + .78 * pulse + f.fright, 0, 1);
+    const core = [.55, 1, .32].map(v => v * b);
+    const x = Math.floor(f.x * H / cw), y = Math.floor(f.y * H / ch);
+    putOverlay(x, y, core, G[f.small ? "\u2022" : "\u25CF"]);
+  }
 }
 
 function sparkColour(u) {
@@ -635,6 +708,7 @@ function render() {
   gl.generateMipmap(gl.TEXTURE_2D);
 
   overlay.fill(0);
+  if (fliesOn) drawFlies();
   for (const s of sparks) {
     const u = s.age / s.life, c = sparkColour(u);
     putOverlay(Math.floor(s.px), Math.floor(s.py), [c[0] * .5, c[1] * .5, c[2] * .5], G["."]);
@@ -661,6 +735,9 @@ function render() {
 }
 
 resize();
+for (let i = 0; i < CFG.fireflies; i++) {
+  flies.push({ x: rand(0, W / H), y: rand(.1, .85), vx: 0, vy: 0, seed: rand(0, 900), rate: rand(.9, 1.7), fright: 0, small: i % 5 > 2 });
+}
 
 // ---- host API (same shape as the other scenes) -----------------------------
 let paused = false;
@@ -671,6 +748,7 @@ const ascii = window.ascii = {
     const nx = x * cols;
     if (cursor.x >= 0) windGoal = clamp(windGoal + (nx - cursor.x) * .018, -2.2, 2.2);
     cursor.x = nx;
+    mouse.x = x * W / H; mouse.y = y;
   },
   click: strike,
   release() { press = null; },
@@ -678,7 +756,7 @@ const ascii = window.ascii = {
   setPaused(p) { paused = p; if (!p) { last = 0; wall = 0; requestAnimationFrame(loop); } },
   // For testing: advance instantly, and render one frame to a PNG.
   warp(seconds) { for (let i = 0; i < seconds * 30; i++) step(1 / 30); },
-  state: () => ({ phase, level: +level.toFixed(3), embers: +embers.toFixed(3), charge: +charge.toFixed(2), burnLeft: Math.round(burnLeft) }),
+  state: () => ({ phase, level: +level.toFixed(3), embers: +embers.toFixed(3), charge: +charge.toFixed(2), burnLeft: Math.round(burnLeft), flyNearest: flies.reduce((n, f) => Math.min(n, Math.hypot(f.x - mouse.x, f.y - mouse.y)), 9), flyInFire: flies.filter(f => inFire(flyBounds(), f.x, f.y)).length, flyOutside: flies.filter(f => outOfFrame(flyBounds(), f.x, f.y)).length }),
   frame() { render(); return canvas.toDataURL("image/png"); },
   // The lock screen picture: a fully burning fire, always the same one. Whatever
   // the live fire is doing is put back afterwards, so this can't light it.
@@ -692,6 +770,7 @@ const ascii = window.ascii = {
       t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
+    fliesOn = false;   // the lock screen stays the same picture every time
     phase = "burning"; level = 1; embers = 1; burnLeft = 1e9;
     surge = 0; flash = 0; press = null; wind = windGoal = 0; T = 40;
     sparks.length = 0;
@@ -700,6 +779,7 @@ const ascii = window.ascii = {
     render();
     const png = canvas.toDataURL("image/png");
     Math.random = random;
+    fliesOn = true;
     ({ phase, phaseAge, level, embers, charge, flash, burnLeft, surge, press, T, flick, wind, windGoal } = keep);
     sparks.length = 0;
     stepTongues(0);

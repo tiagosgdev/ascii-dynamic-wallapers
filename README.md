@@ -8,7 +8,7 @@ Animated, interactive ASCII-art desktop wallpapers for macOS. Each scene runs li
 |---|---|---|---|---|
 | **Black Hole** | A tilted accretion disk that slowly drifts and changes shape as the view orbits | Adds a tiny black hole that spirals in and merges (up to 3 at once) | Warps the view around it | Zooms in and out |
 | **Koi Pond** | Koi swim around the pond | Drops food and the fish swarm to it | Scares the fish | Nothing |
-| **Campfire** | Cold, unlit logs until you light them | See below | Nothing | Nothing |
+| **Campfire** | Cold, unlit logs until you light them, with fireflies drifting around | See below | Fireflies scatter away from it | Nothing |
 | **Chess** | Your game waits while a warm light drifts across the board | Click a piece, then a square | Lifts your pieces, shows their legal moves and names any piece | Orbits the camera |
 
 ### Campfire lifecycle
