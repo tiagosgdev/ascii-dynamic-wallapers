@@ -1,0 +1,544 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ASCII Black Hole</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #03040a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+// ---- tunables -------------------------------------------------------------
+const CFG = {
+  fps: 30,
+  cellW: 7,          // CSS px per character
+  cellH: 10,
+  ramp: " .:;t%SX#8@",
+  rollDeg: 16,       // how far the disk leans, right side up
+  inclDeg: 3,        // camera height above the disk plane at the start
+  inclSwing: 9,      // how far the camera rises and falls over a cycle
+  orbitPeriod: 36,   // seconds for one full cycle
+  offsetX: .16,      // black hole position relative to screen centre
+  offsetY: -.08,
+};
+for (const [k, v] of new URLSearchParams(location.search)) {
+  if (k in CFG) CFG[k] = typeof CFG[k] === "number" ? +v : v;
+}
+const CAM_DIST = 30, FOCAL = 4.2, ESCAPE2 = 2500;
+
+// ---- shaders --------------------------------------------------------------
+const VERT = `#version 300 es
+void main(){ vec2 p=vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position=vec4(p*2.-1.,0,1); }`;
+
+// Pass 1: one texel per character cell. Traces a light ray past a Schwarzschild
+// black hole (units: Schwarzschild radius = 1).
+// Output: R brightness, G disk temperature, B star, A background nebula.
+const SIM = `#version 300 es
+precision highp float;
+uniform vec2 uCells, uMouse, uOffset;
+uniform float uAspect, uT, uIncl, uRoll, uFocal, uLens;
+uniform int uMiniOn;
+uniform vec4 uMini[3];   // x, y, z, Schwarzschild radius (0 = unused)
+uniform vec4 uRing;      // ringdown: ring shift x, ring shift y, ring gain, disk flash
+out vec4 o;
+
+float h13(vec3 p){ p=fract(p*.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float vn(vec3 p){
+  vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(
+    mix(mix(h13(i),h13(i+vec3(1,0,0)),f.x), mix(h13(i+vec3(0,1,0)),h13(i+vec3(1,1,0)),f.x), f.y),
+    mix(mix(h13(i+vec3(0,0,1)),h13(i+vec3(1,0,1)),f.x), mix(h13(i+vec3(0,1,1)),h13(i+vec3(1,1,1)),f.x), f.y),
+    f.z);
+}
+float fbm(vec3 p){
+  float a=.5, s=0.;
+  for(int i=0;i<4;i++){ s+=a*vn(p); p=p*2.03+vec3(17.1,3.7,9.2); a*=.5; }
+  return s/.9375;
+}
+
+// Disk gas carried around by Keplerian rotation. The first value is the large
+// drifting structure that makes the motion readable; the second is fine detail.
+vec2 material(float r, float th, float tau, float seed){
+  float a=th+.7*pow(r/3.,-1.5)*tau;
+  float ca=cos(a), sa=sin(a);
+  return vec2(fbm(vec3(r*2.1+seed, ca*2.6, sa*2.6)),
+              fbm(vec3(r*4.6+seed*.7, ca*2.2, sa*2.2)));
+}
+
+// Two half-offset layers cross-fade so the shear never winds up over time.
+vec2 turbulence(float r, float th){
+  const float C=10.;
+  float p1=fract(uT/C), p2=fract(uT/C+.5);
+  float w1=1.-abs(2.*p1-1.), w2=1.-abs(2.*p2-1.);
+  return (material(r,th,(p1-.5)*C,0.)*w1+material(r,th,(p2-.5)*C,40.)*w2)/(w1+w2);
+}
+
+// Emission at a disk crossing. alpha gets opacity; hot gets temperature 0-1.
+float disk(vec3 p, vec3 vel, out float alpha, out float hot){
+  alpha=0.; hot=0.;
+  float r=length(p.xz);
+  if(r<2.7 || r>30.) return 0.;
+  float th=atan(p.z,p.x);
+
+  // Flares sweep around the disk and keep reshaping its outline. Only the
+  // sides reach far, so the arms run long while the arc over the top stays compact.
+  float flare=smoothstep(.42,.8,fbm(vec3(cos(th+.22*uT)*1.3, sin(th+.22*uT)*1.3, 5.+uT*.04)));
+  float sides=pow(abs(p.x)/r,3.);
+  float rOut=7.4+3.8*flare+(5.+13.*flare)*sides;
+  float edge=smoothstep(2.7,3.5,r)*(1.-smoothstep(rOut*.62,rOut,r));
+  if(edge<=0.) return 0.;
+
+  vec2 m=turbulence(r,th);
+  float n=m.x, clump=smoothstep(.3,.72,n), fine=smoothstep(.26,.74,m.y);
+  float dens=mix(.5,1.25,clump)*(.72+.56*fine);
+  // The outer disk breaks into streaks; the inner disk stays nearly solid.
+  dens*=mix(.12,1.,smoothstep(.34,.5,n+.26-.045*max(r-5.,0.)));
+
+  vec3 vDir=vec3(p.z,0.,-p.x)/r;
+  float beta=sqrt(.5/r);
+  float dop=1./(sqrt(1.-beta*beta)*(1.-beta*dot(vDir,-normalize(vel))));
+
+  // A small black hole clears a gap in the gas and heats a collar around it.
+  float near=0.;
+  if(uMiniOn>0) for(int j=0;j<3;j++){
+    float rs=uMini[j].w;
+    if(rs<=0.) continue;
+    float dd=length(p-uMini[j].xyz);
+    dens*=smoothstep(rs*2.4,rs*4.2,dd);
+    float e=(dd-rs*4.8)/(rs*2.4);
+    near+=exp(-e*e);
+  }
+
+  float profile=pow(4.3/max(r,3.4),1.55);
+  float flash=1.+uRing.w*exp(-(r-3.4)*(r-3.4)/5.);
+  float em=profile*dens*pow(dop,2.3)*edge*(1.+near*2.4)*flash;
+  alpha=clamp(edge*dens*.72,0.,1.);
+  hot=clamp(.3+(dop-1.)*2.4+.75*(3.8/r-.5)+(clump-.5)*.35+near*.75+(flash-1.)*.5,0.,1.);
+  return em;
+}
+
+void main(){
+  vec2 uv=(gl_FragCoord.xy/uCells*2.-1.)*vec2(uAspect,1.);
+
+  // Cursor acts as a small gravitational lens.
+  vec2 dm=uv-uMouse;
+  float d2=dot(dm,dm);
+  uv-=uLens*.016*dm/(d2+.006);
+  float halo=uLens*exp(-d2/.012);
+
+  uv-=uOffset;
+  float nebula=exp(-length(uv)*1.15);
+
+  float c=cos(uRoll), s=sin(uRoll);
+  uv=mat2(c,-s,s,c)*uv;
+
+  float ci=cos(uIncl), si=sin(uIncl);
+  vec3 pos=vec3(0.,si,ci)*${CAM_DIST}.;
+  vec3 f=vec3(0.,-si,-ci), right=vec3(1.,0.,0.), up=cross(right,f);
+  vec3 vel=normalize(f*uFocal+right*uv.x+up*uv.y);
+
+  vec3 h=cross(pos,vel);
+  float h2=dot(h,h), acc=0., heat=0., trans=1., star=0., side=pos.y;
+  float minD[3]=float[3](1e9,1e9,1e9), minB[3]=float[3](0.,0.,0.);
+  bool captured=false;
+  for(int i=0;i<170;i++){
+    float r2=dot(pos,pos);
+    if(r2<1.02){ captured=true; break; }
+    if(r2>${ESCAPE2}. && dot(pos,vel)>0.) break;
+    float r=sqrt(r2), dt=clamp(.09*r,.05,1.6);
+    vec3 pull=-1.5*h2*pos/(r2*r2*r);
+
+    // Each small black hole bends the ray with the same formula, scaled by its size.
+    if(uMiniOn>0) for(int j=0;j<3;j++){
+      float rs=uMini[j].w;
+      if(rs<=0.) continue;
+      vec3 q=pos-uMini[j].xyz;
+      float d2=dot(q,q);
+      if(d2<rs*rs*6.76){ captured=true; break; }   // its visible shadow is 2.6 rs
+      float d=sqrt(d2);
+      vec3 L=cross(q,normalize(vel));
+      if(d<minD[j]){ minD[j]=d; minB[j]=length(L); }
+      pull+=-1.5*rs*.25*dot(L,L)*q/(d2*d2*d);   // weaker than true mass, so it warps locally
+      dt=min(dt,max(.05,.12*d));
+    }
+    if(captured) break;
+
+    vec3 prev=pos;
+    vel+=pull*dt;
+    pos+=vel*dt;
+    float next=pos.y;
+    if(side*next<0.){
+      vec3 hit=mix(prev,pos,side/(side-next));
+      float a, t, em=disk(hit,vel,a,t);
+      float gain=trans*em*a;
+      acc+=gain; heat+=gain*t;
+      trans*=1.-a;
+      if(trans<.02) break;
+    }
+    side=next;
+  }
+  if(!captured && trans>.3){
+    vec3 d=normalize(vel);
+    vec3 g=floor(d*420.);
+    if(h13(g)>.996) star=.4+.6*h13(g+7.);
+  }
+
+  // The true photon ring is thinner than a character cell, so it is drawn
+  // from the ray's impact parameter to keep it continuous at this resolution.
+  // After a merger the ring shivers: it bulges in an oval that rings down.
+  float ang=atan(uv.y,uv.x);
+  float x=(sqrt(h2)-2.68-uRing.x*cos(2.*ang)-uRing.y*sin(2.*ang))/.055;
+  float ring=trans*exp(-x*x)*1.7*(1.+uRing.z);
+  acc+=ring; heat+=ring;
+
+  // Each small black hole gets its own thin photon ring.
+  if(uMiniOn>0) for(int j=0;j<3;j++){
+    float rs=uMini[j].w;
+    if(rs<=0. || minD[j]>1e8) continue;
+    float e=(minB[j]-2.7*rs)/.09;
+    float g=trans*exp(-e*e)*1.5;
+    acc+=g; heat+=g;
+    // A small ember halo, so it still reads as a black hole in empty space.
+    float ember=trans*.5*exp(-max(minB[j]-2.7*rs,0.)/(rs*.6));
+    if(minB[j]>2.7*rs){ acc+=ember; heat+=ember*.35; }
+  }
+
+  float T=acc>1e-4?heat/acc:.5;
+  float I=1.-exp(-acc*1.1);
+  if(halo*.24>I){ I=halo*.24; T=.45; }
+  o=vec4(clamp(I,0.,1.),clamp(T,0.,1.),star*trans,nebula);
+}`;
+
+// Pass 2: full resolution. Turns each cell's brightness into a coloured glyph.
+const DRAW = `#version 300 es
+precision highp float;
+uniform sampler2D uSim, uAtlas;
+uniform ivec2 uCell;
+uniform float uT;
+uniform int uN;
+out vec4 o;
+
+float h(vec3 p){ p=fract(p*.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+
+vec3 five(vec3 a, vec3 b, vec3 c, vec3 d, vec3 e, float x){
+  x=clamp(x,0.,1.)*4.;
+  if(x<1.) return mix(a,b,x);
+  if(x<2.) return mix(b,c,x-1.);
+  if(x<3.) return mix(c,d,x-2.);
+  return mix(d,e,x-3.);
+}
+
+// Cooler, receding gas burns ember and rose; hot approaching gas goes champagne.
+vec3 ramp(float x, float t){
+  vec3 cool=five(vec3(.03,.02,.06), vec3(.20,.05,.16), vec3(.56,.15,.22), vec3(.90,.43,.28), vec3(1.,.78,.58), x);
+  vec3 hot =five(vec3(.05,.04,.07), vec3(.30,.17,.15), vec3(.78,.55,.40), vec3(.99,.87,.70), vec3(1.,.98,.95), x);
+  return mix(cool,hot,t);
+}
+
+float I(ivec2 c){ return texelFetch(uSim,c,0).r; }
+
+void main(){
+  ivec2 px=ivec2(gl_FragCoord.xy), c=px/uCell, s=px-c*uCell;
+  ivec2 sz=textureSize(uSim,0);
+  c=min(c,sz-1);
+  vec4 d=texelFetch(uSim,c,0);
+  float v=d.r, T=d.g, star=d.b, nebula=d.a;
+  vec3 C=vec3(vec2(c),0.);
+
+  float seed=h(C+3.);
+  float tick=floor(uT*6.+seed*6.);
+  float j=(h(C+vec3(0,0,tick))-.5)*.1;
+
+  int g=0;
+  if(v>.05) g=clamp(int(pow(clamp(v+j,0.,1.),.62)*float(uN-1))+1,1,uN-1);
+  else if(star>0.) g=star>.75?2:1;
+
+  float ink=g>0?texelFetch(uAtlas,ivec2(g*uCell.x+s.x,uCell.y-1-s.y),0).r:0.;
+  bool inset=s.x>0&&s.y>0&&s.x<uCell.x-1&&s.y<uCell.y-1;
+
+  // Deep navy space, lifted a little around the hole; dithered to hide banding.
+  vec3 space=vec3(.010,.012,.028)+vec3(.018,.032,.082)*nebula+(seed-.5)/255.;
+
+  vec3 col;
+  if(v>.05){
+    vec3 bg=mix(space,ramp(pow(v,1.15)*.7,T),inset?1.:.3);
+    vec3 fg=ramp(min(1.,v*.6+.46),T);
+    col=mix(bg,fg,ink);
+  } else {
+    col=mix(space,vec3(.42,.47,.62),ink*(.25+.45*star));
+  }
+
+  // Soft bleed out of bright cells, tinted by their temperature.
+  ivec2 m=sz-1;
+  float glow=(I(clamp(c+ivec2(2,0),ivec2(0),m))+I(clamp(c-ivec2(2,0),ivec2(0),m))
+             +I(clamp(c+ivec2(0,2),ivec2(0),m))+I(clamp(c-ivec2(0,2),ivec2(0),m)))*.25;
+  col+=mix(vec3(.20,.05,.05),vec3(.20,.13,.10),T)*glow*glow*.5;
+  o=vec4(col,1.);
+}`;
+
+// ---- GL setup --------------------------------------------------------------
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", {
+  alpha: false, antialias: false, depth: false, stencil: false,
+  powerPreference: "low-power", preserveDrawingBuffer: false,
+});
+if (!gl) throw new Error("WebGL2 unavailable");
+
+function program(fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    u[name.replace("[0]", "")] = gl.getUniformLocation(p, name);
+  }
+  return { p, u };
+}
+
+const sim = program(SIM), draw = program(DRAW);
+gl.bindVertexArray(gl.createVertexArray());
+
+const simTex = gl.createTexture(), atlasTex = gl.createTexture(), fbo = gl.createFramebuffer();
+let W = 0, H = 0, cols = 0, rows = 0, cw = 0, ch = 0;
+
+function nearest(tex) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function buildAtlas() {
+  const n = CFG.ramp.length;
+  const cv = document.createElement("canvas");
+  cv.width = cw * n; cv.height = ch;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#fff";
+  g.font = `700 ${Math.round(ch * .95)}px Menlo, "DejaVu Sans Mono", ui-monospace, monospace`;
+  g.textAlign = "center"; g.textBaseline = "middle";
+  for (let i = 0; i < n; i++) g.fillText(CFG.ramp[i], cw * (i + .5), ch * .54);
+  nearest(atlasTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  const ncw = Math.max(4, Math.round(CFG.cellW * dpr)), nch = Math.max(6, Math.round(CFG.cellH * dpr));
+  if (w === W && h === H && ncw === cw && nch === ch) return;
+  W = canvas.width = w; H = canvas.height = h; cw = ncw; ch = nch;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  nearest(simTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, simTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  buildAtlas();
+}
+addEventListener("resize", resize);
+resize();
+
+// ---- interaction state -----------------------------------------------------
+const deg = Math.PI / 180;
+const state = {
+  paused: false,
+  mx: .5, my: .5, sx: .5, sy: .5,   // cursor target and eased value (0-1, top-left origin)
+  lastMove: -1e9, lens: 0,
+  zoom: 1, zoomT: 1,
+  incl: CFG.inclDeg * deg, roll: CFG.rollDeg * deg,
+  bodies: [null, null, null],
+  next: 0,
+};
+const now = () => performance.now() / 1000;
+const toUV = (x, y) => [(x * 2 - 1) * (W / H), 1 - y * 2];
+
+// Follows the same bent light path as the shader to find the piece of disk
+// actually visible under a screen point.
+function diskPointAt(x, y) {
+  const [u0, v0] = toUV(x, y);
+  const u = u0 - CFG.offsetX, v = v0 - CFG.offsetY;
+  const c = Math.cos(state.roll), s = Math.sin(state.roll);
+  const a = c * u + s * v, b = -s * u + c * v;
+  const ci = Math.cos(state.incl), si = Math.sin(state.incl);
+  const F = FOCAL * state.zoom;
+
+  let px = 0, py = si * CAM_DIST, pz = ci * CAM_DIST;
+  let vx = a, vy = -si * F + ci * b, vz = -ci * F - si * b;
+  const n = Math.hypot(vx, vy, vz); vx /= n; vy /= n; vz /= n;
+  const hx = py * vz - pz * vy, hy = pz * vx - px * vz, hz = px * vy - py * vx;
+  const h2 = hx * hx + hy * hy + hz * hz;
+
+  for (let i = 0; i < 200; i++) {
+    const r2 = px * px + py * py + pz * pz;
+    if (r2 < 1.02) break;
+    if (r2 > ESCAPE2 && px * vx + py * vy + pz * vz > 0) break;
+    const r = Math.sqrt(r2), dt = Math.min(1.6, Math.max(.05, .09 * r));
+    const k = -1.5 * h2 / (r2 * r2 * r) * dt;
+    vx += k * px; vy += k * py; vz += k * pz;
+    const ny = py + vy * dt;
+    if (py * ny < 0) {
+      const t = py / (py - ny);
+      const hitX = px + vx * dt * t, hitZ = pz + vz * dt * t, hr = Math.hypot(hitX, hitZ);
+      if (hr > 2.7 && hr < 12) {   // further out there is rarely gas to click on
+        return [hitX, 0, hitZ];
+      }
+    }
+    px += vx * dt; py = ny; pz += vz * dt;
+  }
+
+  // Nothing to hit: use the point under the cursor, level with the hole.
+  const sc = CAM_DIST / F;
+  return [a * sc, ci * b * sc, -si * b * sc];
+}
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+
+const ascii = window.ascii = {
+  pointer(x, y) { state.mx = x; state.my = y; state.lastMove = now(); },
+  click(x, y) {
+    state.bodies[state.next++ % 3] = spawnBody(diskPointAt(x, y));
+  },
+  scroll(dy) { state.zoomT = clamp(state.zoomT * Math.exp(-dy * .0025), .55, 2.4); },
+  setPaused(p) { state.paused = p; if (!p) requestAnimationFrame(loop); },
+  // Renders one frame at a fixed time and returns it as a PNG (for testing).
+  frame(t) { render(t); return canvas.toDataURL("image/png"); },
+};
+
+// Direct input for when the page runs in a normal browser or browser-based host.
+addEventListener("pointermove", e => ascii.pointer(e.clientX / innerWidth, e.clientY / innerHeight));
+addEventListener("pointerdown", e => ascii.click(e.clientX / innerWidth, e.clientY / innerHeight));
+addEventListener("wheel", e => ascii.scroll(e.deltaY), { passive: true });
+
+// ---- small black holes -----------------------------------------------------
+// Each click adds one. It orbits with the gas, spirals in on a fixed schedule,
+// flattens into the disk plane, and merges. The orbit is a closed-form function
+// of age, so nothing has to be stepped frame by frame.
+const MERGE_R = 1.7, RINGDOWN = 4.5;
+
+function spawnBody(P) {
+  let px = P[0], py = P[1], pz = P[2];
+  let len = Math.hypot(px, py, pz);
+  if (len < 1e-3) { px = 1; py = 0; pz = 0; len = 1; }
+  const ux = px / len, uy = py / len, uz = pz / len;
+  // Tangent = up x radial, which matches the direction the gas orbits.
+  let tx = uz, tz = -ux;
+  const tl = Math.hypot(tx, tz);
+  if (tl < .05) { tx = 0; tz = -1; } else { tx /= tl; tz /= tl; }
+  const R0 = clamp(len, 4.5, 14), T = 6.5 + Math.random() * 2;
+  return {
+    t: now(), R0, T, ux, uy, uz, tx, tz,
+    rs: .32 * clamp((CAM_DIST - pz) / CAM_DIST, .4, 1),
+    mergeAge: T * (1 - (MERGE_R / R0) ** 4),
+  };
+}
+
+function bodyState(b, age) {
+  const u = Math.min(age / b.T, .9999), left = 1 - u;
+  const r = b.R0 * left ** .25;
+  const psi = 2.2 * .7 * (b.R0 / 3) ** -1.5 * b.T * 1.6 * (1 - left ** .625);
+  const c = Math.cos(psi), s = Math.sin(psi);
+  const flat = 1 - Math.min(1, u / .7) ** 2;
+  return {
+    x: r * (b.ux * c + b.tx * s),
+    y: r * b.uy * c * flat,
+    z: r * (b.uz * c + b.tz * s),
+  };
+}
+
+const minis = new Float32Array(12);
+function bodyUniforms(clock) {
+  let on = 0, rx = 0, ry = 0, gain = 0, flash = 0;
+  minis.fill(0);
+  state.bodies.forEach((b, i) => {
+    if (!b) return;
+    const age = clock - b.t;
+    if (age > b.mergeAge + RINGDOWN) { state.bodies[i] = null; return; }
+    if (age < b.mergeAge) {
+      const p = bodyState(b, age);
+      minis[i * 4] = p.x; minis[i * 4 + 1] = p.y; minis[i * 4 + 2] = p.z;
+      minis[i * 4 + 3] = b.rs * Math.min(1, age / .4);
+      on = 1;
+    } else {
+      const a = age - b.mergeAge, env = Math.exp(-a / 1.15);
+      const shift = .28 * env * Math.sin(11 * a);
+      const end = bodyState(b, b.mergeAge), ph = 2 * Math.atan2(end.z, end.x);
+      rx += shift * Math.cos(ph); ry += shift * Math.sin(ph);
+      gain += 1.1 * env;
+      flash += 1.7 * Math.exp(-a / .7);
+    }
+  });
+  gl.uniform1i(sim.u.uMiniOn, on);
+  gl.uniform4fv(sim.u.uMini, minis);
+  gl.uniform4f(sim.u.uRing, rx, ry, gain, flash);
+}
+
+// ---- render ----------------------------------------------------------------
+function render(t) {
+  const clock = now();
+
+  // Ease toward the input; the cursor lens fades out once the mouse rests.
+  state.sx += (state.mx - state.sx) * .09;
+  state.sy += (state.my - state.sy) * .09;
+  state.zoom += (state.zoomT - state.zoom) * .12;
+  const lensT = clock - state.lastMove < 3.5 ? 1 : 0;
+  state.lens += (lensT - state.lens) * .08;
+
+  const drift = .5 - .5 * Math.cos(t * 2 * Math.PI / CFG.orbitPeriod);
+  state.incl = (CFG.inclDeg + CFG.inclSwing * drift + (state.sy - .5) * 12) * deg;
+  state.roll = (CFG.rollDeg + (state.sx - .5) * 12) * deg;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, cols, rows);
+  gl.useProgram(sim.p);
+  gl.uniform2f(sim.u.uCells, cols, rows);
+  gl.uniform2f(sim.u.uOffset, CFG.offsetX, CFG.offsetY);
+  gl.uniform1f(sim.u.uAspect, W / H);
+  gl.uniform1f(sim.u.uT, t);
+  gl.uniform1f(sim.u.uIncl, state.incl);
+  gl.uniform1f(sim.u.uRoll, state.roll);
+  gl.uniform1f(sim.u.uFocal, FOCAL * state.zoom);
+  gl.uniform1f(sim.u.uLens, state.lens);
+  const [mu, mv] = toUV(state.sx, state.sy);
+  gl.uniform2f(sim.u.uMouse, mu, mv);
+  bodyUniforms(clock);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(draw.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex); gl.uniform1i(draw.u.uSim, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, atlasTex); gl.uniform1i(draw.u.uAtlas, 1);
+  gl.uniform2i(draw.u.uCell, cw, ch);
+  gl.uniform1f(draw.u.uT, t);
+  gl.uniform1i(draw.u.uN, CFG.ramp.length);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let last = 0;
+function loop(ts) {
+  if (state.paused) return;
+  requestAnimationFrame(loop);
+  if (ts - last < 1000 / CFG.fps - 2) return;
+  last = ts;
+  ascii.frames = (ascii.frames || 0) + 1;
+  render(ts / 1000);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

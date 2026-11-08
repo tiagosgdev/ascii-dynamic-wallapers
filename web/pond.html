@@ -1,0 +1,502 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ASCII Koi Pond</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #171717; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+// ---- tunables -------------------------------------------------------------
+const CFG = {
+  fps: 30,
+  cell: 9,             // CSS px per square tile
+  pellets: 8,          // food per click
+  maxFood: 64,
+  density: 1500,       // grid cells of water per fish
+};
+for (const [k, v] of new URLSearchParams(location.search)) if (k in CFG) CFG[k] = +v;
+
+const GLYPHS = " .:-/\\|!oXS●";
+const G = { dot: 1, colon: 2, dash: 3, slash: 4, back: 5, bar: 6, bang: 7, o: 8, X: 9, S: 10, food: 11 };
+const TILE = 64, EYE = 128;
+const BG = 23 / 255;
+
+const COLORS = {
+  white:  [.73, .71, .67],
+  bright: [.83, .81, .77],
+  grey:   [.42, .41, .40],
+  dark:   [.24, .24, .24],
+  orange: [.87, .47, .17],
+  amber:  [.91, .63, .29],
+  red:    [.76, .26, .12],
+  slate:  [.25, .25, .41],
+  eye:    [.10, .10, .10],
+};
+
+// ---- helpers ---------------------------------------------------------------
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const angDiff = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+
+function hash(x, y) {
+  let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  let fx = x - ix, fy = y - iy;
+  fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+  return lerp(lerp(hash(ix, iy), hash(ix + 1, iy), fx),
+              lerp(hash(ix, iy + 1), hash(ix + 1, iy + 1), fx), fy);
+}
+
+// Glyph that best draws a line heading along (dx, dy), with y pointing down.
+function lineGlyph(dx, dy) {
+  let a = Math.atan2(dy, dx) * 180 / Math.PI;
+  a = ((a % 180) + 180) % 180;
+  if (a < 22.5 || a >= 157.5) return G.dash;
+  if (a < 67.5) return G.back;
+  if (a < 112.5) return G.bar;
+  return G.slash;
+}
+
+// ---- GL --------------------------------------------------------------------
+const VERT = `#version 300 es
+void main(){ vec2 p=vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position=vec4(p*2.-1.,0,1); }`;
+
+// Each texel of uD is one tile: RGB colour, alpha = glyph index plus flags.
+const FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uD, uAtlas;
+uniform int uCell, uH, uGap;
+out vec4 o;
+void main(){
+  ivec2 px=ivec2(gl_FragCoord.xy); px.y=uH-1-px.y;
+  ivec2 c=px/uCell, s=px-c*uCell;
+  vec4 d=texelFetch(uD,c,0);
+  int a=int(d.a*255.+.5), g=a&63;
+  bool tile=(a&64)!=0, eye=(a&128)!=0;
+  const vec3 BG=vec3(${BG});
+  float ink=g>0?texelFetch(uAtlas,ivec2(g*uCell+s.x,s.y),0).r:0.;
+  vec3 col=BG;
+  if(tile||eye){
+    if(s.x<uCell-uGap && s.y<uCell-uGap)
+      col=mix(d.rgb, eye?vec3(.92):d.rgb*.6, ink);
+  } else if(a!=0){
+    col=mix(BG,d.rgb,ink);
+  }
+  o=vec4(col,1.);
+}`;
+
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", {
+  alpha: false, antialias: false, depth: false, stencil: false, powerPreference: "low-power",
+});
+if (!gl) throw new Error("WebGL2 unavailable");
+
+const prog = gl.createProgram();
+for (const [type, src] of [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, FRAG]]) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  gl.attachShader(prog, s);
+}
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray());
+const U = n => gl.getUniformLocation(prog, n);
+gl.uniform1i(U("uD"), 0);
+gl.uniform1i(U("uAtlas"), 1);
+
+function texture(unit) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                        [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+    gl.texParameteri(gl.TEXTURE_2D, k, v);
+}
+texture(1);
+texture(0);
+
+let W = 0, H = 0, cell = 0, cols = 0, rows = 0, data = new Uint8Array(4);
+
+function buildAtlas() {
+  const cv = document.createElement("canvas");
+  cv.width = cell * GLYPHS.length; cv.height = cell;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#fff";
+  g.font = `700 ${Math.round(cell * .72)}px Menlo, "DejaVu Sans Mono", ui-monospace, monospace`;
+  g.textAlign = "center"; g.textBaseline = "middle";
+  for (let i = 0; i < GLYPHS.length; i++) g.fillText(GLYPHS[i], cell * (i + .5), cell * .52);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  const c = Math.max(6, Math.round(CFG.cell * dpr));
+  if (w === W && h === H && c === cell) return;
+  W = canvas.width = w; H = canvas.height = h; cell = c;
+  cols = Math.ceil(W / cell); rows = Math.ceil(H / cell);
+  data = new Uint8Array(cols * rows * 4);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  buildAtlas();
+  gl.viewport(0, 0, W, H);
+  gl.uniform1i(U("uCell"), cell);
+  gl.uniform1i(U("uH"), H);
+  gl.uniform1i(U("uGap"), Math.max(1, Math.round(dpr)));
+}
+addEventListener("resize", resize);
+resize();
+
+// ---- simulation ------------------------------------------------------------
+const JOINTS = 16;
+let T = 0, nextRain = 1;
+const fish = [], food = [], ripples = [];
+const cursor = { x: -99, y: -99, moved: -99 };
+
+function makeFish() {
+  const L = rand(28, 41), x = rand(8, cols - 8), y = rand(8, rows - 8), a = rand(0, 6.28);
+  const pts = [];
+  for (let i = 0; i < JOINTS; i++) pts.push({ x: x - Math.cos(a) * i * L / (JOINTS - 1), y: y - Math.sin(a) * i * L / (JOINTS - 1) });
+  const depth = Math.random() < .35 ? rand(.6, .85) : rand(0, .3);
+  const kind = Math.random();
+  return {
+    pts, L, seg: L / (JOINTS - 1), W: L * .12, a, v: rand(3, 6), cruise: rand(4.5, 9),
+    wander: 0, phase: rand(0, 6.28), depth, depthWant: depth, depthAt: rand(10, 30),
+    seed: rand(0, 900),
+    // Pattern thresholds: more orange, more red, or sparse with dark spots.
+    orangeAt: kind < .4 ? .52 : .6, redAt: kind < .4 ? .71 : .76, spots: kind > .75,
+  };
+}
+
+function populate() {
+  const want = clamp(Math.round(cols * rows / CFG.density), 5, 18);
+  while (fish.length < want) fish.push(makeFish());
+  fish.length = want;
+}
+populate();
+addEventListener("resize", populate);
+
+function ripple(x, y, k, max, delay = 0, life = 3.6) {
+  if (ripples.length > 26) ripples.shift();
+  ripples.push({ x, y, k, max, age: -delay, life });
+}
+
+function dropFood(x, y) {
+  ripple(x, y, .75, 21);
+  ripple(x, y, .5, 14, .28);
+  for (let i = 0; i < CFG.pellets; i++) {
+    if (food.length >= CFG.maxFood) food.shift();
+    const a = rand(0, 6.28), r = Math.sqrt(Math.random()) * 7;
+    const px = x + Math.cos(a) * r, py = y + Math.sin(a) * r;
+    food.push({ x: px, y: py, vx: Math.cos(a) * rand(.4, 1.8), vy: Math.sin(a) * rand(.4, 1.8), hp: rand(1.6, 3.2), seed: rand(0, 99) });
+    ripple(px, py, .28, 4, rand(.02, .3), 1.5);
+  }
+}
+
+function nearestFood(x, y) {
+  let best = null, bd = 1e12;
+  for (const p of food) {
+    const d = (p.x - x) ** 2 + (p.y - y) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best ? { p: best, d: Math.sqrt(bd) } : null;
+}
+
+function steer(f, dt) {
+  const head = f.pts[0];
+  const target = nearestFood(head.x, head.y);
+  const feeding = !!target;
+  let dx, dy, speedWant = f.cruise;
+
+  if (feeding) {
+    dx = (target.p.x - head.x) / (target.d || 1);
+    dy = (target.p.y - head.y) / (target.d || 1);
+    if (target.d < 3) {
+      target.p.hp -= dt;
+      speedWant = 2.5;
+      if (Math.random() < dt * 1.5) ripple(target.p.x, target.p.y, .22, 4, 0, 1.2);
+    } else {
+      speedWant = target.d < 10 ? 8 : 20;
+    }
+  } else {
+    f.wander = clamp(f.wander + rand(-1, 1) * 2.4 * dt, -.55, .55);
+    dx = Math.cos(f.a + f.wander);
+    dy = Math.sin(f.a + f.wander);
+  }
+
+  // Keep off the walls.
+  const m = 13;
+  if (head.x < m) dx += (m - head.x) / m * 2.4;
+  if (head.x > cols - m) dx -= (head.x - cols + m) / m * 2.4;
+  if (head.y < m) dy += (m - head.y) / m * 2.4;
+  if (head.y > rows - m) dy -= (head.y - rows + m) / m * 2.4;
+
+  // Avoid other bodies. Feeding fish tolerate a tighter crowd.
+  const R = feeding ? 5.5 : 10;
+  for (const g of fish) {
+    if (g === f) continue;
+    for (const i of [0, 5, 10]) {
+      const ox = head.x - g.pts[i].x, oy = head.y - g.pts[i].y, d = Math.hypot(ox, oy);
+      if (d > 0 && d < R) { const k = (1 - d / R) * 1.7 / d; dx += ox * k; dy += oy * k; }
+    }
+  }
+
+  // Shy away from a moving cursor.
+  if (T - cursor.moved < 1.8 && !feeding) {
+    const ox = head.x - cursor.x, oy = head.y - cursor.y, d = Math.hypot(ox, oy);
+    if (d > 0 && d < 15) { const k = (1 - d / 15) * 2.5 / d; dx += ox * k; dy += oy * k; speedWant += 5; }
+  }
+
+  // Turn rate follows speed, so a slow fish sweeps a wide arc instead of curling up.
+  const turn = (feeding ? clamp(f.v / (f.L * .22), 1.2, 3.5) : clamp(f.v / (f.L * .42), .3, 1.1)) * dt;
+  f.a += clamp(angDiff(f.a, Math.atan2(dy, dx)), -turn, turn);
+  f.v += (speedWant - f.v) * Math.min(1, dt * 2.5);
+
+  head.x += Math.cos(f.a) * f.v * dt;
+  head.y += Math.sin(f.a) * f.v * dt;
+  f.phase += dt * (2.6 + f.v * .55);
+
+  for (let i = 1; i < JOINTS; i++) {
+    const p = f.pts[i], q = f.pts[i - 1];
+    const ax = p.x - q.x, ay = p.y - q.y, d = Math.hypot(ax, ay) || 1;
+    p.x = q.x + ax / d * f.seg;
+    p.y = q.y + ay / d * f.seg;
+  }
+
+  // Food brings everyone to the surface; otherwise fish drift between depths.
+  if ((f.depthAt -= dt) <= 0) {
+    f.depthAt = rand(12, 34);
+    f.depthWant = Math.random() < .35 ? rand(.6, .85) : rand(0, .3);
+  }
+  const goal = feeding ? 0 : f.depthWant;
+  f.depth += (goal - f.depth) * Math.min(1, dt * (feeding ? 1.4 : .16));
+}
+
+function step(dt) {
+  T += dt;
+  if ((nextRain -= dt) <= 0) {
+    nextRain = rand(1.3, 3.4);
+    ripple(rand(0, cols), rand(0, rows), rand(.16, .3), rand(10, 18));
+  }
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    if ((ripples[i].age += dt) > ripples[i].life) ripples.splice(i, 1);
+  }
+  for (let i = food.length - 1; i >= 0; i--) {
+    const p = food[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 1 - dt * .9; p.vy *= 1 - dt * .9;
+    if (p.hp <= 0) { ripple(p.x, p.y, .3, 5, 0, 1.4); food.splice(i, 1); }
+  }
+  for (const f of fish) steer(f, dt);
+}
+
+// ---- rasteriser -------------------------------------------------------------
+function put(x, y, c, glyph, flags = 0) {
+  if (x < 0 || y < 0 || x >= cols || y >= rows) return;
+  const i = (y * cols + x) * 4;
+  data[i] = c[0] * 255; data[i + 1] = c[1] * 255; data[i + 2] = c[2] * 255;
+  data[i + 3] = glyph | flags;
+}
+const empty = (x, y) => x >= 0 && y >= 0 && x < cols && y < rows && data[(y * cols + x) * 4 + 3] === 0;
+const fade = (c, o) => [lerp(BG, c[0], o), lerp(BG, c[1], o), lerp(BG, c[2], o)];
+const shade = (c, k) => [Math.min(1, c[0] * k), Math.min(1, c[1] * k), Math.min(1, c[2] * k)];
+
+function drawRipples() {
+  for (const r of ripples) {
+    if (r.age < 0) continue;
+    const u = r.age / r.life, radius = r.max * (1 - (1 - u) ** 2) + .5;
+    const k = r.k * (1 - u) ** 1.3;
+    for (const ring of [radius, radius * .72]) {
+      const steps = Math.max(8, Math.ceil(ring * 6.28 / 1.05));
+      for (let j = 0; j < steps; j++) {
+        const th = j / steps * 6.283;
+        const x = Math.floor(r.x + Math.cos(th) * ring), y = Math.floor(r.y + Math.sin(th) * ring);
+        if (hash(x * 3 + j, y + Math.floor(T * 3)) < .14) continue;
+        if (empty(x, y)) { const v = .12 + k * .75; put(x, y, [v, v, v * 1.02], lineGlyph(-Math.sin(th), Math.cos(th))); }
+      }
+    }
+  }
+}
+
+function bodyHalfWidth(f, s) {
+  const u = s / .78;
+  const w = f.W * Math.pow(Math.max(0, Math.sin(Math.PI * Math.pow(u, .62))), .72);
+  return u > .5 ? Math.max(w, f.W * .16) : w;
+}
+
+function koiColour(f, s, lat, tx, ty) {
+  const seed = f.seed;
+  const n = noise(s * 6.2 + seed, lat * 1.5 + seed * .37);
+  const spot = noise(s * 13 + seed * 1.7, lat * 3.1 - seed);
+  const mark = hash(Math.floor(s * 24) + Math.floor(seed), Math.floor(lat * 3));
+  let c, glyph;
+  if (Math.abs(lat) > .84) {
+    c = n > f.orangeAt + .1 ? COLORS.orange : COLORS.grey;
+    glyph = mark < .4 ? G.dot : 0;
+  } else if (f.spots && spot > .77) {
+    c = COLORS.slate; glyph = 0;
+  } else if (n > f.redAt) {
+    c = COLORS.red; glyph = mark < .55 ? G.X : G.S;
+  } else if (n > f.orangeAt) {
+    c = mark < .25 ? COLORS.amber : COLORS.orange; glyph = mark < .55 ? G.X : G.S;
+  } else {
+    c = mark < .25 ? COLORS.bright : COLORS.white; glyph = mark < .22 ? G.X : (mark < .5 ? G.dot : 0);
+  }
+  return [shade(c, .94 + hash(tx, ty) * .12), glyph];
+}
+
+function drawFish(f) {
+  const o = 1 - f.depth * .74, showDetail = f.depth < .5;
+  const q = f.pts.map((p, i) => {
+    const a = f.pts[Math.max(0, i - 1)], b = f.pts[Math.min(JOINTS - 1, i + 1)];
+    const tx = b.x - a.x, ty = b.y - a.y, d = Math.hypot(tx, ty) || 1;
+    const off = 1.1 * Math.sin(f.phase - i * .78) * Math.pow(i / (JOINTS - 1), 1.3);
+    return { x: p.x - ty / d * off, y: p.y + tx / d * off, nx: -ty / d, ny: tx / d };
+  });
+
+  const pad = f.W * 2.2, reach2 = (pad + f.seg * 1.6) ** 2;
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const p of q) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
+  x0 = Math.max(0, Math.floor(x0 - pad)); x1 = Math.min(cols - 1, Math.ceil(x1 + pad));
+  y0 = Math.max(0, Math.floor(y0 - pad)); y1 = Math.min(rows - 1, Math.ceil(y1 + pad));
+
+  for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+    const px = cx + .5, py = cy + .5;
+
+    // Most of the bounding box is open water; skip it before the per-segment search.
+    let coarse = 1e12, nearest = 0;
+    for (let i = 0; i < JOINTS; i += 3) {
+      const ox = px - q[i].x, oy = py - q[i].y, d2 = ox * ox + oy * oy;
+      if (d2 < coarse) { coarse = d2; nearest = i; }
+    }
+    if (coarse > reach2) continue;
+
+    let best = 1e12, s = 0, side = 0;
+    const from = Math.max(0, nearest - 3), to = Math.min(JOINTS - 1, nearest + 3);
+    for (let i = from; i < to; i++) {
+      const a = q[i], b = q[i + 1];
+      const ex = b.x - a.x, ey = b.y - a.y, l2 = ex * ex + ey * ey || 1;
+      const t = clamp(((px - a.x) * ex + (py - a.y) * ey) / l2, 0, 1);
+      const dx = px - (a.x + ex * t), dy = py - (a.y + ey * t), d2 = dx * dx + dy * dy;
+      if (d2 < best) { best = d2; s = (i + t) / (JOINTS - 1); side = ex * dy - ey * dx; }
+    }
+    const d = Math.sqrt(best);
+
+    if (s < .78) {
+      const w = bodyHalfWidth(f, s);
+      if (d < w) {
+        const lat = (side < 0 ? -1 : 1) * d / Math.max(.01, w);
+        const [c, g] = koiColour(f, s, lat, cx, cy);
+        put(cx, cy, fade(c, o), showDetail ? g : 0, TILE);
+        continue;
+      }
+      // Pectoral fins.
+      const near = Math.abs(s - .25) / .075;
+      if (near < 1) {
+        const reach = w + f.W * (1 - near) * (.85 + .25 * Math.sin(f.phase * .7 + (side < 0 ? 0 : 2)));
+        if (d < reach) { put(cx, cy, fade(COLORS.dark, o * .95), 0, TILE); continue; }
+      }
+      // Faint disturbed water hugging the body.
+      if (showDetail && d < w + 1.8 && s < .65 && empty(cx, cy) && hash(cx * 7, cy + Math.floor(T * 5)) < .26) {
+        const v = .2 * o;
+        put(cx, cy, [v, v, v], hash(cx, cy) < .5 ? G.colon : G.bang);
+      }
+    } else {
+      const t = (s - .78) / .22;
+      if (s > .995) continue; // no rounded cap, which would close the fork
+      const w = f.W * (.18 + .8 * t);
+      if (d > w) continue;
+      if (t > .6 && d < f.W * .6 * (t - .6) / .4) continue; // fork
+      const k = (1 - t * .68) * o;
+      put(cx, cy, fade(t < .35 ? COLORS.grey : COLORS.dark, Math.max(.2, k)), 0, TILE);
+    }
+  }
+
+  if (!showDetail) return;
+
+  // Eyes sit on the widest part of the head.
+  const h = q[2], eyeW = bodyHalfWidth(f, 2 / (JOINTS - 1)) * .72;
+  for (const sgn of [-1, 1]) {
+    put(Math.floor(h.x + h.nx * eyeW * sgn), Math.floor(h.y + h.ny * eyeW * sgn), COLORS.eye, G.o, EYE);
+  }
+
+  // Whiskers point forward and out from the mouth.
+  const fx = Math.cos(f.a), fy = Math.sin(f.a), n0 = q[0];
+  for (const sgn of [-1, 1]) for (let r = 1; r <= 2; r++) {
+    const wx = fx + n0.nx * sgn * .75, wy = fy + n0.ny * sgn * .75;
+    const x = Math.floor(n0.x + fx * r * 1.2 + n0.nx * sgn * (1 + r * .85));
+    const y = Math.floor(n0.y + fy * r * 1.2 + n0.ny * sgn * (1 + r * .85));
+    if (empty(x, y)) { const v = .5 * o; put(x, y, [v, v, v], lineGlyph(wx, wy)); }
+  }
+}
+
+function drawFood() {
+  for (const p of food) {
+    const t = .78 + .22 * Math.sin(T * 5 + p.seed);
+    put(Math.floor(p.x), Math.floor(p.y), [.96 * t, .68 * t, .25 * t], G.food);
+  }
+}
+
+function render() {
+  data.fill(0);
+  drawRipples();
+  [...fish].sort((a, b) => b.depth - a.depth).forEach(drawFish);
+  drawFood();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ---- host API (same shape as the other scenes) -----------------------------
+let paused = false;
+const ascii = window.ascii = {
+  pointer(x, y) {
+    const nx = x * cols, ny = y * rows;
+    // Only count real movement, so a resting cursor doesn't spook the fish.
+    if (Math.hypot(nx - cursor.x, ny - cursor.y) > .4) cursor.moved = T;
+    cursor.x = nx; cursor.y = ny;
+  },
+  click(x, y) { dropFood(x * cols, y * rows); },
+  scroll() {},
+  setPaused(p) { paused = p; if (!p) { last = 0; requestAnimationFrame(loop); } },
+  // For testing: advance the pond instantly, and render one frame to a PNG.
+  warp(seconds) { for (let i = 0; i < seconds * 30; i++) step(1 / 30); },
+  frame() { render(); return canvas.toDataURL("image/png"); },
+  stats: () => ({ fish: fish.length, food: food.length, cols, rows }),
+};
+
+addEventListener("pointermove", e => ascii.pointer(e.clientX / innerWidth, e.clientY / innerHeight));
+addEventListener("pointerdown", e => ascii.click(e.clientX / innerWidth, e.clientY / innerHeight));
+
+let last = 0;
+function loop(ts) {
+  if (paused) return;
+  requestAnimationFrame(loop);
+  if (last && ts - last < 1000 / CFG.fps - 2) return;
+  const dt = last ? Math.min((ts - last) / 1000, .05) : 1 / CFG.fps;
+  last = ts;
+  ascii.frames = (ascii.frames || 0) + 1;
+  step(dt);
+  render();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
