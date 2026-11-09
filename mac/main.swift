@@ -43,8 +43,14 @@ private let sceneOverrides: [String: [URLQueryItem]] = {
 
 private let saverName = "ASCII Wallpapers.saver"
 
+private extension NSScreen {
+    var displayID: CGDirectDisplayID {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+}
+
 final class Wall: NSObject, WKNavigationDelegate {
-    let screen: NSScreen
+    private(set) var screen: NSScreen
     let window: NSWindow
     let web: WKWebView
     private let onLoad: (Wall) -> Void
@@ -87,6 +93,15 @@ final class Wall: NSObject, WKNavigationDelegate {
     }
 
     func close() { window.orderOut(nil); window.close() }
+
+    /// Takes over the new NSScreen object if it is still the same display at the same
+    /// size and scale, which means the running page can carry on untouched.
+    func adopt(_ other: NSScreen) -> Bool {
+        guard other.displayID == screen.displayID, other.frame == screen.frame,
+              other.backingScaleFactor == screen.backingScaleFactor else { return false }
+        screen = other
+        return true
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -121,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let saved = UserDefaults.standard.string(forKey: sceneKey) ?? "pond"
         sceneIndex = scenes.firstIndex { $0.id == saved } ?? 0
 
-        buildWalls()
+        syncWalls()
         buildMenu()
         registerHotKey()
         syncSaver()
@@ -142,17 +157,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Walls and scenes
 
-    private func buildWalls() {
-        walls.forEach { $0.close() }
-        walls = NSScreen.screens.map { screen in
-            Wall(screen: screen, page: currentPage) { [weak self] wall in
+    /// Gives each display a wall, leaving alone any wall whose display hasn't changed.
+    @objc private func syncWalls() {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        var spare = walls
+        walls = screens.map { screen in
+            if let i = spare.firstIndex(where: { $0.adopt(screen) }) { return spare.remove(at: i) }
+            return Wall(screen: screen, page: currentPage) { [weak self] wall in
                 if self?.paused == true { wall.call("ascii.setPaused(true)") }
                 self?.applyStill(to: wall)
             }
         }
+        spare.forEach { $0.close() }
     }
 
-    @objc private func screensChanged() { buildWalls() }
+    /// macOS posts this in bursts, dozens at a time around display sleep and wake, and
+    /// usually nothing has really changed. So wait for it to go quiet, then compare.
+    @objc private func screensChanged() {
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(syncWalls), object: nil)
+        perform(#selector(syncWalls), with: nil, afterDelay: 1)
+    }
 
     private func wall(at p: NSPoint) -> Wall? {
         walls.first { NSMouseInRect(p, $0.screen.frame, false) }
