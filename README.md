@@ -8,7 +8,7 @@ Animated, interactive ASCII-art desktop wallpapers for macOS. Each scene runs li
 |---|---|---|---|---|
 | **Black Hole** | A tilted accretion disk that slowly drifts and changes shape as the view orbits | Adds a tiny black hole that spirals in and merges (up to 3 at once) | Warps the view around it | Zooms in and out |
 | **Koi Pond** | Koi swim around the pond | Drops food and the fish swarm to it | Scares the fish | Nothing |
-| **Campfire** | Cold, unlit logs until you light them, with fireflies drifting around | See below | Fireflies scatter away from it | Nothing |
+| **Campfire** | Cold, unlit logs in a ring of stones until you light them, with fireflies drifting around a clearing | See below | Fireflies scatter away from it, and moving it sideways leans the flames and smoke | Nothing |
 | **Chess** | Your game waits while a warm light drifts across the board | Click a piece, then a square | Lifts your pieces, shows their legal moves and names any piece | Orbits the camera |
 
 ### Campfire lifecycle
@@ -16,9 +16,11 @@ Animated, interactive ASCII-art desktop wallpapers for macOS. Each scene runs li
 1. About 6 quick clicks light the fire.
 2. It grows for about a minute.
 3. It burns for an hour at 80-100% strength. The hour follows the real clock, including time the Mac spends asleep.
-4. It fades over about 2 minutes, then goes out until you light it again.
+4. It fades over about 2 minutes, then goes out until you light it again. The coals keep glowing and smoking for a minute or two after the last flame.
 
 While it's burning, a burst of quick clicks adds 10 minutes. Pressing and holding the mouse button starts the fade straight away and speeds it up, taking about 4.5 seconds from full to nothing.
+
+While it burns, the fire lights the ground, the stones and the tree trunks round the clearing, and the stars dim. Three `CFG` values tone this down if it's too much behind your windows: `scenery` (brightness of the firelit ground, trees and stars, 0 to hide them), `smoke` and `sparks` (0 for none). Set them as described in [Settings for one machine](#settings-for-one-machine).
 
 ### Chess
 

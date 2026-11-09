@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ASCII Fireplace</title>
+<title>ASCII Campfire</title>
 <style>
   html, body { margin: 0; height: 100%; background: #030303; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; }
@@ -33,11 +33,14 @@ const CFG = {
   flyDrift: .06,     // their calm top speed, in screen heights per second
   flyFlee: .55,      // how much faster a frightened one can go
   flyAvoid: .2,      // how close the cursor gets before they scatter, in screen heights
+  scenery: 1,        // brightness of the firelit ground, trees and stars (0 hides them)
+  smoke: 1,          // how thick the smoke is (0 for none)
+  sparks: 1,         // how many sparks fly, relative to normal
 };
 for (const [k, v] of new URLSearchParams(location.search)) if (k in CFG) CFG[k] = +v;
 
 const RAMP = " .:;i!*%S#@";
-const GLYPHS = RAMP + "'\u25CF\u2022";
+const GLYPHS = RAMP + "'\u25CF\u2022`,~|\"+ol";
 const G = Object.fromEntries([...GLYPHS].map((c, i) => [c, i]));
 
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -48,8 +51,12 @@ const hash = (x, y) => {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 };
 
-// ---- the woodpile ------------------------------------------------------------
-// World: x right, y up from the hearth floor, z toward the viewer.
+// ---- the clearing ------------------------------------------------------------
+// World: x right, y up from the ground, z toward the viewer. The camera sits a
+// few steps back from the fire, looking slightly down at it.
+const CAM_Y = 1.6, CAM_D = 5.5;
+// The woodpile, in its own units: FIRE of them make one world unit.
+const FIRE = 1.2;
 const LOGS = [
   { a: [-1.02, .21, -.42], b: [ .98, .21, -.58], r: .21, s: 3 },   // long one at the back
   { a: [ -.22, .19,  .64], b: [1.08, .18,  .42], r: .185, s: 8 },  // front right
@@ -57,32 +64,68 @@ const LOGS = [
   { a: [-1.06, .22,  .04], b: [ .44, .88, -.08], r: .165, s: 1 },  // the big one leaning across
   { a: [ .56, .64, -.48], b: [ .30, .43,  .46], r: .13, s: 5 },    // short one, end toward us
 ];
-const CAM_Y = 1.6, CAM_D = 5.5;
+
+// A ring of stones round the hearth, each lying with its long side along the ring.
+const RING_X = 1.94, RING_Z = 1.44;
+const STONES = Array.from({ length: 18 }, (_, i) => {
+  const ang = (i + .2 + .45 * hash(i, 3)) / 18 * Math.PI * 2;
+  const along = .15 + .07 * hash(i, 5), across = .11 + .04 * hash(i, 9), tall = .09 + .07 * hash(i, 7);
+  const cs = Math.cos(ang), sn = Math.sin(ang);
+  return {
+    c: [cs * RING_X, tall * .5, sn * RING_Z],
+    r: [Math.hypot(along * sn, across * cs), tall, Math.hypot(along * cs, across * sn)],
+    s: 1 + i * 1.7,
+  };
+});
+
+// Trunks standing round the clearing: x, z, radius.
+const TREES = [
+  [-5.7, -3.1, .30], [-4.7, -7.8, .34], [-8.6, -8.4, .40], [-3.4, -12.5, .36], [-10.5, -13, .5], [-1.9, -17, .4],
+  [5.5, -2.5, .27], [4.1, -8.6, .36], [7.9, -6.4, .38], [2.7, -13.5, .38], [9.6, -12, .46], [6.3, -17, .44],
+];
+
 const MAX_TONGUES = 20;
-const vec3s = f => LOGS.map(l => `vec3(${f(l).map(v => v.toFixed(3)).join(",")})`).join(",");
+const v3 = (list, f) => list.map(l => `vec3(${f(l).map(v => v.toFixed(3)).join(",")})`).join(",");
+const f1 = (list, f) => list.map(l => f(l).toFixed(3)).join(",");
 
 // ---- shaders --------------------------------------------------------------
 const VERT = `#version 300 es
 void main(){ vec2 p=vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position=vec4(p*2.-1.,0,1); }`;
 
-// Pass 1: one texel per character, ray traced. Output: RGB colour, A glyph
-// density (0 = empty space, drawn with no character).
+// Pass 1: one texel per character, ray traced. Two outputs. The first is the
+// cell's colour, with how it is to be drawn packed into alpha. The second is
+// what the bloom is made from: the fire's own cells, with how dense a character
+// each gets in alpha.
 const SIM = `#version 300 es
 precision highp float;
 uniform vec2 uRes, uCellPx;
-uniform float uScale, uFloor, uT, uLevel, uEmbers, uFlick, uFlash, uWind;
+uniform float uScale, uFloor, uT, uLevel, uEmbers, uFlick, uFlash, uWind, uAir, uSmoke, uScenery;
+uniform vec3 uLamp;                   // where the firelight on the ground comes from
 uniform vec4 uRoot[${MAX_TONGUES}];   // xyz where the flame leaves the wood, w height
 uniform vec4 uTong[${MAX_TONGUES}];   // x half-width, yz lean, w phase
-out vec4 o;
+layout(location=0) out vec4 o;
+layout(location=1) out vec4 oGlow;
 
-const int NL=${LOGS.length};
-const vec3 LA[NL]=vec3[NL](${vec3s(l => l.a)});
-const vec3 LB[NL]=vec3[NL](${vec3s(l => l.b)});
-const float LR[NL]=float[NL](${LOGS.map(l => l.r.toFixed(3)).join(",")});
-const float LS[NL]=float[NL](${LOGS.map(l => l.s.toFixed(1)).join(",")});
+const int NL=${LOGS.length}, NS=${STONES.length}, NT=${TREES.length};
+const vec3 LA[NL]=vec3[NL](${v3(LOGS, l => l.a)});
+const vec3 LB[NL]=vec3[NL](${v3(LOGS, l => l.b)});
+const float LR[NL]=float[NL](${f1(LOGS, l => l.r)});
+const float LS[NL]=float[NL](${f1(LOGS, l => l.s)});
+const vec3 SC[NS]=vec3[NS](${v3(STONES, s => s.c)});
+const vec3 SR[NS]=vec3[NS](${v3(STONES, s => s.r)});
+const float SS[NS]=float[NS](${f1(STONES, s => s.s)});
+const vec3 TP[NT]=vec3[NT](${v3(TREES, t => t)});
 
-const vec3 BOXMIN=vec3(-1.55,-.05,-1.1), BOXMAX=vec3(1.55,3.4,1.15);
+const vec3 RO=vec3(0.,${CAM_Y.toFixed(2)},${CAM_D.toFixed(2)});
+const float FS=${FIRE.toFixed(2)};
+const vec3 BOXMIN=vec3(-1.55,-.05,-1.1), BOXMAX=vec3(1.55,3.4,1.15);   // the fire, in its own units
+const vec3 RINGMIN=vec3(-2.4,-.05,-1.9), RINGMAX=vec3(2.4,.5,1.9);     // the stones round it
 const float HMAX=2.7;
+const vec3 WARM=vec3(1.,.47,.15);
+
+// How a cell outside the fire will be drawn: a character, and whether it sits
+// on a faint tint (0), on nothing (1) or on a solid block (2).
+int gGlyph, gFill;
 
 float h21(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
 float vn(vec2 p){
@@ -95,6 +138,8 @@ float fbm(vec2 p){
   for(int i=0;i<4;i++){ s+=a*vn(p); p=ROT*p+vec2(3.1,7.7); a*=.5; }
   return s/.9375;
 }
+float luma(vec3 c){ return dot(c,vec3(.3,.55,.15)); }
+int ramp(float l){ return clamp(int(pow(clamp(l,0.,1.),.52)*${RAMP.length - 1}.)+1,1,${RAMP.length - 1}); }
 
 vec3 fireRamp(float x){
   x=clamp(x,0.,1.)*5.;
@@ -107,6 +152,14 @@ vec3 fireRamp(float x){
   return mix(c4,c5,x-4.);
 }
 
+bool hitBox(vec3 ro, vec3 inv, vec3 mn, vec3 mx, out float tIn, out float tOut){
+  vec3 t0=(mn-ro)*inv, t1=(mx-ro)*inv;
+  vec3 a=min(t0,t1), b=max(t0,t1);
+  tIn=max(max(a.x,a.y),a.z); tOut=min(min(b.x,b.y),b.z);
+  return tOut>max(tIn,0.);
+}
+
+// ---- the fire: logs, flames and the bed of coals, all in the fire's own units ----
 float cyl(vec3 p, vec3 a, vec3 b, float r){
   vec3 ba=b-a, pa=p-a;
   float baba=dot(ba,ba), paba=dot(pa,ba);
@@ -243,85 +296,266 @@ vec3 shadeFloor(vec3 p, inout float cover){
   return (mix(ash,hot,smoothstep(.04,.34,uEmbers))+vec3(.3,.13,.04)*lit*inner*.35)*lump*contact;
 }
 
+// ---- round the fire, in world units ----
+float ell(vec3 p, vec3 r){
+  float k0=length(p/r), k1=length(p/(r*r));
+  return k0*(k0-1.)/max(k1,1e-4);
+}
+float stoneDist(vec3 p, out int id){
+  float best=1e9;
+  for(int i=0;i<NS;i++){
+    float d=ell(p-SC[i],SR[i]);
+    if(d<best){ best=d; id=i; }
+  }
+  return best;
+}
+float stoneDist(vec3 p){ int id; return stoneDist(p,id); }
+vec3 stoneNormal(vec3 p){
+  const vec2 e=vec2(.004,-.004);
+  return normalize(e.xyy*stoneDist(p+e.xyy)+e.yyx*stoneDist(p+e.yyx)+e.yxy*stoneDist(p+e.yxy)+e.xxx*stoneDist(p+e.xxx));
+}
+// How much of the lamp a point on the ground can see past the stones.
+float shadow(vec3 p, vec3 lamp){
+  vec3 d=lamp-p;
+  float far=length(d), res=1., t=.05;
+  d/=far;
+  for(int i=0;i<18;i++){
+    float h=stoneDist(p+d*t);
+    res=min(res,2.5*h/t);
+    t+=clamp(h,.04,.4);
+    if(res<.01 || t>far) break;
+  }
+  return .3+.7*clamp(res,0.,1.);
+}
+
+vec3 shadeStone(vec3 p, int i, float lampI){
+  float seed=SS[i];
+  vec3 n=stoneNormal(p);
+  vec3 q=p*8.+seed;
+  n=normalize(n+(vec3(vn(q.yz),vn(q.zx),vn(q.xy))-.5)*.55);
+  vec3 rock=mix(vec3(.3,.28,.27),vec3(.66,.61,.56),fbm(q.xz*1.3+q.y));
+  vec3 toCore=vec3(.0,.5,.0)-p;
+  float dCore=length(toCore);
+  float heart=max(dot(n,toCore/dCore),0.)/(1.+dCore*dCore*.3);
+  vec3 toTop=vec3(.0,2.,.0)-p;
+  float dTop=length(toTop);
+  float crown=max(dot(n,toTop/dTop),0.)/(1.+dTop*dTop*.5);
+  float light=lampI*(heart*2.+crown*3.+.16)+uEmbers*.22*heart;
+  vec3 col=rock*(WARM*light*1.25+vec3(.03,.011,.004)*lampI);
+  float cold=1.-smoothstep(.02,.4,max(uLevel,uEmbers*.45));
+  float sky=max(dot(n,normalize(vec3(-.2,.86,.46))),0.);
+  col=max(col,rock*vec3(.7,.82,1.)*(.015+.45*sky*sqrt(sky))*cold);
+  gGlyph=ramp(luma(col)); gFill=2;
+  return col;
+}
+
+// Firelit earth, stippled with characters that thin out as the light does.
+vec3 shadeGround(vec3 p, vec2 cell, float lampI){
+  float r=length(p.xz);
+  float reach=1./(1.+r*r*.17);
+  float earth=.5+.5*fbm(p.xz*1.6+4.);
+  float seen=lampI*reach;
+  if(seen>.004 && r<12.) seen*=shadow(vec3(p.x,.02,p.z),uLamp);
+  vec3 col=WARM*seen*earth*.68*uScenery;
+  // Which cells carry a character never changes, only how brightly they're lit.
+  float cover=clamp(reach*reach*2.4,0.,.55)*(.45+.55*earth);
+  float pick=h21(cell+3.);
+  if(pick<cover*sign(uScenery)){
+    float kind=h21(cell+41.)*(1.6-reach);
+    gGlyph=kind<.22?${G[":"]}:kind<.38?${G[";"]}:kind<.5?${G['"']}:kind<.7?${G[","]}:kind<.86?${G["'"]}:kind<1.?${G["`"]}:${G["."]};
+    if(h21(cell+77.)<.03) gGlyph=${G["o"]};
+    col=col*1.5+vec3(.011,.013,.019)*earth*uScenery;
+  } else col*=.3;
+  return col;
+}
+
+// A trunk at the edge of the clearing, lit on the side that faces the fire.
+vec3 shadeTree(vec3 p, int i, vec2 cell, float lampI){
+  vec3 T=TP[i];
+  vec2 n=(p.xz-T.xy)/T.z;
+  vec3 toFire=vec3(0.,1.1,0.)-p;
+  float d=length(toFire);
+  float facing=clamp(dot(vec3(n.x,0.,n.y),toFire/d)*.8+.2,0.,1.);
+  float seed=float(i)*7.3;
+  float ang=atan(n.y,n.x);
+  float bark=fbm(vec2(ang*2.5+seed,p.y*.6));
+  float furrow=smoothstep(.3,.62,vn(vec2(ang*8.+seed*3.,p.y*.3)));
+  float seen=lampI*facing*facing/(1.+d*d*.04)*exp(-max(p.y-.8,0.)*.3);
+  vec3 col=WARM*seen*(.45+.55*bark)*(.6+.4*furrow)*1.5*uScenery;
+  // The lit side is drawn solidly and the far side thins out into the dark.
+  float pick=h21(cell+7.);
+  if(pick<(.25+.6*facing)*(.6+.4*furrow)*sign(uScenery)){
+    float kind=h21(cell+19.);
+    gGlyph=kind<.62?${G["|"]}:kind<.8?${G["!"]}:kind<.92?${G["l"]}:${G[":"]};
+  } else col*=.3;
+  return col;
+}
+
+// Night sky above the treetops. The stars dim as the fire takes your eyes.
+vec3 shadeSky(vec2 uv, vec2 cell){
+  float tops=2.75+.6*vn(vec2(uv.x*.5,3.))+.55*abs(fract(uv.x*1.25+vn(vec2(uv.x*2.,9.))*.7)-.5);
+  if(uv.y<tops) return vec3(.004,.004,.005);
+  vec3 col=vec3(.005,.006,.01);
+  float band=exp(-pow((uv.y-3.9-uv.x*.2)/.5,2.));
+  float pick=h21(cell+17.);
+  if(pick<(.011+.02*band)*sign(uScenery)){
+    float size=h21(cell+5.);
+    float twinkle=.78+.22*sin(uT*(.5+1.3*h21(cell+23.))+size*40.);
+    float b=(.1+.42*size*size)*twinkle*(1.-.62*uLevel)*uScenery;
+    col=mix(vec3(.62,.72,1.),vec3(1.,.9,.74),h21(cell+29.))*b;
+    gGlyph=size>.93?${G["+"]}:size>.6?${G["'"]}:${G["."]};
+    gFill=1;
+  }
+  return col;
+}
+
 void main(){
-  vec2 px=gl_FragCoord.xy*uCellPx;
+  vec2 cell=gl_FragCoord.xy;
+  vec2 px=cell*uCellPx;
   vec2 uv=vec2(px.x-uRes.x*.5,px.y-uFloor)/uScale;
+  gGlyph=0; gFill=0;
 
   // Off-axis camera, looking slightly down: uv is the point at z=0.
-  vec3 ro=vec3(0.,${CAM_Y.toFixed(2)},${CAM_D.toFixed(2)});
+  vec3 ro=RO;
   vec3 rd=normalize(vec3(uv,0.)-ro);
-
   vec3 inv=1./rd;
-  vec3 t0=(BOXMIN-ro)*inv, t1=(BOXMAX-ro)*inv;
-  vec3 tmin=min(t0,t1), tmax=max(t0,t1);
-  float tIn=max(max(tmin.x,tmin.y),tmin.z), tOut=min(min(tmax.x,tmax.y),tmax.z);
-  bool inBox=tOut>tIn;
+  // The same ray in the fire's units.
+  vec3 rof=ro/FS;
+  vec2 uvf=uv/FS;
+  // The light the fire throws on its surroundings flickers less than the flames do.
+  float lampI=uLevel*(1.+(uFlick-1.05)*.5)+uEmbers*.08+uFlash*.1;
 
-  // One warp per ray keeps the flame edges crisp at character resolution.
-  vec2 s1=uv*vec2(2.1,1.5)-vec2(0.,uT*1.75);
-  vec2 warp=vec2(fbm(s1),fbm(s1+vec2(5.2,1.3)))-.5;
-
-  // Find the first solid thing along the ray.
+  // Find the first solid thing along the ray: ground, a trunk, a stone or a log.
+  int kind=rd.y<0.?1:0, hitId=-1;
   float tHit=rd.y<0.?-ro.y/rd.y:1e9;
-  bool floorHit=rd.y<0.;
-  int hitId=-1;
+  for(int i=0;i<NT;i++){
+    vec2 oc=ro.xz-TP[i].xy;
+    float a=dot(rd.xz,rd.xz), b=dot(oc,rd.xz), c=dot(oc,oc)-TP[i].z*TP[i].z;
+    float disc=b*b-a*c;
+    if(disc>0.){
+      float t=(-b-sqrt(disc))/a;
+      if(t>0. && t<tHit){ tHit=t; kind=2; hitId=i; }
+    }
+  }
+  float tIn, tOut;
+  if(hitBox(ro,inv,RINGMIN,RINGMAX,tIn,tOut)){
+    float t=tIn;
+    for(int i=0;i<40 && t<min(tOut,tHit);i++){
+      int id;
+      float d=stoneDist(ro+rd*t,id);
+      if(d<.002){ tHit=t; hitId=id; kind=4; break; }
+      t+=d;
+    }
+  }
+  bool inBox=hitBox(rof,inv,BOXMIN,BOXMAX,tIn,tOut);
   if(inBox){
     float t=tIn;
-    for(int i=0;i<48 && t<min(tOut,tHit);i++){
+    for(int i=0;i<48 && t<min(tOut,tHit/FS);i++){
       int id;
-      float d=woodDist(ro+rd*t,id);
-      if(d<.002){ tHit=t; hitId=id; floorHit=false; break; }
+      float d=woodDist(rof+rd*t,id);
+      if(d<.002){ tHit=t*FS; hitId=id; kind=3; break; }
       t+=d;
     }
   }
 
-  vec3 col=vec3(.012,.011,.012);
-  float cover=0.;
-  if(hitId>=0){ col=shadeWood(ro+rd*tHit,rd,hitId); cover=1.; }
-  else if(floorHit) col=shadeFloor(ro+rd*tHit,cover);
+  // Cells that belong to the fire itself are drawn its own way.
+  bool fire=false;
+  vec3 p=ro+rd*tHit;
+  vec3 col;
+  if(kind==0) col=shadeSky(uv,cell);
+  else if(kind==2) col=shadeTree(p,hitId,cell,lampI);
+  else if(kind==3){ col=shadeWood(p/FS,rd,hitId); fire=true; }
+  else if(kind==4) col=shadeStone(p,hitId,lampI);
+  else {
+    col=shadeGround(p,cell,lampI);
+    // Inside the ring the earth gives way to the bed of coals and ash.
+    vec3 pf=p/FS;
+    float rim=length(vec2(pf.x/1.42,pf.z/1.02))+(vn(pf.xz*5.)-.5)*.2;
+    if(rim<1.){
+      float cover=0.;
+      vec3 bed=shadeFloor(pf,cover);
+      float k=smoothstep(.8,1.,rim);
+      if(cover>0.){ col=bed; fire=true; }
+      else { col=mix(bed,col,k); if(h21(cell+13.)>k) gGlyph=0; }
+    }
+  }
+
+  // One warp per ray keeps the flame edges crisp at character resolution.
+  vec2 s1=uvf*vec2(2.1,1.5)-vec2(0.,uT*1.75);
+  vec2 warp=vec2(fbm(s1),fbm(s1+vec2(5.2,1.3)))-.5;
 
   // Walk the ray through the fire, stopping at whatever solid thing it reaches,
   // so flames behind a log are hidden by it and flames in front pass over it.
   if(inBox && uLevel>0.){
     float acc=0., heightAt=0.;
-    float end=min(tOut,tHit), stepLen=.052;
+    float end=min(tOut,tHit/FS), stepLen=.052;
     for(float t=tIn+stepLen*.5;t<end;t+=stepLen){
-      vec3 p=ro+rd*t;
-      float ht=clamp(p.y/HMAX,0.,1.4);
-      vec3 q=p+vec3(warp.x*(.14+ht*.62)-uWind*ht*ht*.5,warp.y*.2,warp.x*(.1+ht*.3));
+      vec3 q0=rof+rd*t;
+      float ht=clamp(q0.y/HMAX,0.,1.4);
+      vec3 q=q0+vec3(warp.x*(.14+ht*.62)-uWind*ht*ht*.5,warp.y*.2,warp.x*(.1+ht*.3));
       float f=flameAt(q);
       // The heart of the fire, down among the logs.
-      vec3 c=(p-vec3(.0,.24,.0))/vec3(.72,.17,.42);
+      vec3 c=(q0-vec3(.0,.24,.0))/vec3(.72,.17,.42);
       f=max(f,exp(-dot(c,c))*min(1.,uLevel*1.8)*(.6+.4*warp.y));
       if(f>0.){ acc+=f; heightAt=max(heightAt,ht); }
     }
     acc*=stepLen/.3;
     if(acc>.01){
-      float streak=fbm(vec2(uv.x*11.,uv.y*3.-uT*3.4));
-      float tear=smoothstep(.2,.75,fbm(vec2(uv.x*5.,uv.y*2.2-uT*2.5)));
-      float vein=fbm(vec2(uv.x*7.,uv.y*2.2-uT*2.6)+11.);
+      float streak=fbm(vec2(uvf.x*11.,uvf.y*3.-uT*3.4));
+      float tear=smoothstep(.2,.75,fbm(vec2(uvf.x*5.,uvf.y*2.2-uT*2.5)));
+      float vein=fbm(vec2(uvf.x*7.,uvf.y*2.2-uT*2.6)+11.);
       float body=(1.-exp(-acc*2.25))*mix(.74,1.12,streak)*mix(.78,1.04,tear);
       float T=body*(1.-.28*clamp(heightAt,0.,1.));
       vec3 fc=fireRamp(T*mix(.82,1.08,vein));
       float a=smoothstep(.05,.36,body);
       col=mix(col,fc,a)+fc*a*.25;
-      if(body>.05) cover=1.;
+      if(body>.05) fire=true;
     }
   }
 
-  float luma=dot(col,vec3(.3,.55,.15));
-  float density=cover>0.?clamp(pow(luma,.52),.04,1.):0.;
-  float dither=(h21(gl_FragCoord.xy)-.5)/255.;
-  o=vec4(col+dither,density);
+  // Smoke: a thin column drifting up from the flame tips, lit from below.
+  if(uSmoke>.004){
+    float base=(.9+1.3*uLevel)*FS;
+    float y=uv.y-base;
+    if(y>-.5){
+      float rise=uT*.26;
+      float mid=uAir*(.2+.3*max(y,0.))*max(y,0.)*.35+(vn(vec2(y*.42-rise*.45,3.))-.5)*(.25+.4*max(y,0.));
+      float wide=.34+.2*max(y,0.);
+      float dx=(uv.x-mid)/wide;
+      float column=exp(-dx*dx)*smoothstep(-.5,.7,y)*exp(-max(y,0.)*.3);
+      vec2 q=vec2((uv.x-mid)*1.5,uv.y*.9-rise);
+      float puff=fbm(q+vec2(fbm(q*.6+vec2(7.,rise*.3))*1.4,0.));
+      float dens=column*smoothstep(.3,.72,puff)*uSmoke;
+      if(dens>.004){
+        vec3 sm=vec3(.12,.125,.14)*(.55+.45*puff)+WARM*lampI*.3*exp(-max(y,0.)*.85);
+        float a=clamp(dens*1.1,0.,.8)*(fire?0.:1.);
+        col=mix(col,sm*.25,a);
+        if(gGlyph==0 && gFill==0 && h21(cell+53.)<dens*1.1){
+          float kind=h21(cell+61.);
+          gGlyph=kind<.45?${G["."]}:kind<.7?${G[":"]}:kind<.88?${G["~"]}:${G["'"]};
+          col=mix(col,sm,a);
+        }
+      }
+    }
+  }
+
+  float dither=(h21(cell)-.5)/255.;
+  if(fire){
+    o=vec4(col+dither,192./255.);
+    oGlow=vec4(col,clamp(pow(luma(col),.52),.04,1.));
+  } else {
+    o=vec4(col+dither,float(gGlyph+gFill*64)/255.);
+    oGlow=vec4(0.);
+  }
 }`;
 
 // Pass 2: full resolution. Characters, sparks and bloom.
 const DRAW = `#version 300 es
 precision highp float;
-uniform sampler2D uSim, uOverlay, uAtlas;
-uniform int uCW, uCH, uH, uGap, uRamp;
-uniform vec2 uRes;
-uniform float uT, uGlow;
+uniform sampler2D uSim, uGlowTex, uOverlay, uAtlas;
+uniform int uCW, uCH, uH, uGap;
+uniform vec2 uRes, uFire;
+uniform float uT, uGlow, uHalo, uUnit;
 out vec4 o;
 float h(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
 
@@ -334,26 +568,37 @@ void main(){
   vec4 d=texelFetch(uSim,simC,0);
   vec4 ov=texelFetch(uOverlay,c,0);
   bool inside=s.x<uCW-uGap && s.y<uCH-uGap;
-  vec3 col;
+  int code=int(d.a*255.+.5), g=code&63, fill=code>>6;
   int oa=int(ov.a*255.+.5);
+  vec3 col;
   if(oa!=0){
-    int g=oa&63;
+    g=oa&63;
     float ink=g>0?texelFetch(uAtlas,ivec2(g*uCW+s.x,s.y),0).r:0.;
     col=mix(d.rgb*.7,ov.rgb,ink);
-  } else if(d.a>0.){
+  } else if(fill==3){
+    // The fire: the brighter the cell, the denser its character, and they shimmer.
     float seed=h(vec2(c)+3.);
     float tick=floor(uT*7.+seed*7.);
     float jitter=(h(vec2(c)+tick*.37)-.5)*.07;
-    int g=clamp(int(pow(clamp(d.a+jitter,0.,1.),.9)*float(uRamp-1))+1,1,uRamp-1);
+    float dens=texelFetch(uGlowTex,simC,0).a;
+    g=clamp(int(pow(clamp(dens+jitter,0.,1.),.9)*${RAMP.length - 1}.)+1,1,${RAMP.length - 1});
     float ink=texelFetch(uAtlas,ivec2(g*uCW+s.x,s.y),0).r;
     col=inside?mix(d.rgb*.56,min(vec3(1.),d.rgb*1.18+.1),ink):d.rgb*.26;
+  } else if(g>0){
+    float back=fill==2?.36:fill==1?0.:.2;
+    float ink=texelFetch(uAtlas,ivec2(g*uCW+s.x,s.y),0).r;
+    col=inside?mix(d.rgb*back,min(vec3(1.),d.rgb*1.25),ink):d.rgb*back*(fill==2?.5:1.);
   } else {
     col=d.rgb;
   }
-  // Light spilling off the fire, from two blurred copies of the image.
+  // Light spilling off the fire: blurred copies of what glows, and a wide soft
+  // halo in the air around it.
   vec2 uv=gl_FragCoord.xy/uRes;
-  vec3 b1=textureLod(uSim,uv,2.5).rgb, b2=textureLod(uSim,uv,4.5).rgb;
+  vec3 b1=textureLod(uGlowTex,uv,2.5).rgb, b2=textureLod(uGlowTex,uv,4.5).rgb;
   col+=(b1*vec3(.28,.19,.13)+b2*vec3(.3,.17,.08))*uGlow;
+  vec2 away=(gl_FragCoord.xy-uFire)/uUnit;
+  float air=1./(1.+dot(away,away)*.3);
+  col+=vec3(.085,.034,.01)*air*air*uHalo;
   o=vec4(col,1.);
 }`;
 
@@ -382,7 +627,7 @@ function program(fs) {
 const sim = program(SIM), draw = program(DRAW);
 gl.bindVertexArray(gl.createVertexArray());
 
-const simTex = gl.createTexture(), overlayTex = gl.createTexture(), atlasTex = gl.createTexture();
+const simTex = gl.createTexture(), glowTex = gl.createTexture(), overlayTex = gl.createTexture(), atlasTex = gl.createTexture();
 const fbo = gl.createFramebuffer();
 function setup(tex, minFilter, magFilter) {
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -391,7 +636,8 @@ function setup(tex, minFilter, magFilter) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
-setup(simTex, gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
+setup(simTex, gl.NEAREST, gl.NEAREST);
+setup(glowTex, gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
 setup(overlayTex, gl.NEAREST, gl.NEAREST);
 setup(atlasTex, gl.NEAREST, gl.NEAREST);
 
@@ -424,10 +670,13 @@ function resize() {
   fw = W * CFG.fireWidth / cw;
   fwRows = W * CFG.fireWidth / ch;
 
-  gl.bindTexture(gl.TEXTURE_2D, simTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, simTex, 0);
+  [simTex, glowTex].forEach((tex, i) => {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex, 0);
+  });
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   gl.bindTexture(gl.TEXTURE_2D, overlayTex);
@@ -438,9 +687,9 @@ addEventListener("resize", resize);
 
 // ---- simulation ------------------------------------------------------------
 // out -> (enough clicks) -> growing -> burning -> fading -> out
-let T = 0, flick = 1, wind = 0, windGoal = 0;
+let T = 0, flick = 1, wind = 0, windGoal = 0, breeze = 0;
 let phase = "out", phaseAge = 0, level = 0, embers = 0, charge = 0, flash = 0;
-let burnLeft = 0, surge = 0, press = null;
+let burnLeft = 0, surge = 0, press = null, smoke = 0, crackleIn = 8;
 const sparks = [];
 const flies = [], mouse = { x: -1, y: -1 };   // mouse in screen heights from the top-left
 let fliesOn = true;
@@ -450,7 +699,7 @@ const noise1 = x => {
   return hash(i, 11) * (1 - u) + hash(i + 1, 11) * u;
 };
 
-// Every flame is rooted at a point on a log's upper surface.
+// A random point on a log's upper surface, where sparks fly from.
 const logWeights = LOGS.map(l => Math.hypot(l.b[0] - l.a[0], l.b[1] - l.a[1], l.b[2] - l.a[2]));
 const logTotal = logWeights.reduce((a, b) => a + b, 0);
 function pointOnWood() {
@@ -470,6 +719,7 @@ function pointOnWood() {
   return point;
 }
 
+// Every flame is rooted at a point on a log's upper surface.
 function respawn(t) {
   const reach = .3 + .75 * level;
   let p = pointOnWood();
@@ -502,15 +752,22 @@ function stepTongues(dt) {
   });
 }
 
+// Sparks live in character cells. Most burn out just above the flames; a few
+// light ones ride the hot air a long way up.
 function emitSpark(x, y, fast) {
-  if (sparks.length > 240) sparks.shift();
-  sparks.push({ x, y, px: x, py: y, vx: rand(-6, 6), vy: -rand(fast ? 22 : 14, fast ? 48 : 32), age: 0, life: rand(.7, 2.3), seed: rand(0, 90) });
+  if (sparks.length > 200) sparks.shift();
+  const floater = !fast && Math.random() < .14;
+  sparks.push({
+    x, y, px: x, py: y, floater,
+    vx: rand(-5, 5) * (fast ? 1.6 : 1), vy: -rand(fast ? 20 : 9, fast ? 44 : 24),
+    age: 0, life: floater ? rand(4, 8) : rand(.8, 2.6), seed: rand(0, 90), heat: rand(.65, 1),
+  });
 }
 
 function sparkBurst(n) {
   for (let i = 0; i < n; i++) {
     const p = pointOnWood();
-    emitSpark(xC + p[0] * fw, yFloor - p[1] * fwRows, true);
+    emitSpark(xC + p[0] * FIRE * fw, yFloor - p[1] * FIRE * fwRows, true);
   }
 }
 
@@ -560,8 +817,13 @@ function lifecycle(dt) {
     level = Math.max(0, level - dt * ((.6 + .8 * level) / CFG.fade + snuffing));
     if (level <= 0) { phase = "out"; phaseAge = 0; }
   }
-  // Coals outlast the flames.
-  embers += ((level > 0 ? Math.min(1, level * 2.5) : 0) - embers) * Math.min(1, dt / (level > 0 ? 3 : 26));
+  // Coals catch quickly and long outlast the flames, unless they're being put out.
+  const coals = level > 0 ? Math.min(1, level * 2.5) : 0;
+  embers += (coals - embers) * Math.min(1, dt / (coals > embers ? 3 : press && press.held ? 5 : 45));
+  // A healthy fire smokes a little; a dying one smokes more, and the coals go on
+  // smoking after the last flame.
+  const smokeGoal = level > 0 ? .4 + .6 * (phase === "fading" ? 1 - level : 0) : Math.min(1, embers * 1.6);
+  smoke += (smokeGoal - smoke) * Math.min(1, dt / 5);
 }
 
 function advanceClock(seconds) {
@@ -570,6 +832,7 @@ function advanceClock(seconds) {
     lifecycle(slice);
     seconds -= slice;
   }
+  if (phase === "out" && embers < .001) smoke = 0;
 }
 
 let wall = 0;
@@ -584,6 +847,7 @@ function step(dt, clockDt = dt) {
   T += dt;
   windGoal *= Math.exp(-dt * 1.5);
   wind += (windGoal - wind) * Math.min(1, dt * 3);
+  breeze = (noise1(T * .045 + 5) - .5) * .7;   // the air is never quite still
   flick = .84 + .3 * noise1(T * 3.1) + .12 * noise1(T * 9 + 40);
   flash *= Math.exp(-dt * 5);
   advanceClock(clockDt);
@@ -591,16 +855,24 @@ function step(dt, clockDt = dt) {
   stepTongues(dt);
   if (fliesOn) stepFlies(dt);
 
-  if (Math.random() < level * 17 * dt) {
+  if (Math.random() < level * 11 * CFG.sparks * dt) {
     const p = pointOnWood();
-    emitSpark(xC + p[0] * fw, yFloor - (p[1] + rand(0, .7 * level)) * fwRows, false);
+    emitSpark(xC + p[0] * FIRE * fw, yFloor - (p[1] + rand(0, .7 * level)) * FIRE * fwRows, false);
   }
+  // Now and then a log pops and throws a few at once.
+  if (level > .25 && (crackleIn -= dt) <= 0) {
+    crackleIn = rand(5, 16);
+    const p = pointOnWood(), n = Math.round(rand(3, 8) * CFG.sparks);
+    for (let i = 0; i < n; i++) emitSpark(xC + p[0] * FIRE * fw, yFloor - p[1] * FIRE * fwRows, true);
+  }
+  const air = wind + breeze;
   for (let i = sparks.length - 1; i >= 0; i--) {
     const s = sparks[i];
     if ((s.age += dt) > s.life) { sparks.splice(i, 1); continue; }
     s.px = s.x; s.py = s.y;
-    s.vx += (noise1(s.seed + T * 2.4) - .5) * 60 * dt + wind * 6 * dt;
-    s.vy += 6 * dt;
+    s.vx += (noise1(s.seed + T * 1.7) - .5) * (s.floater ? 26 : 50) * dt + air * 6 * dt;
+    s.vy += (s.floater ? -1.5 : 6) * dt;
+    if (s.floater) { const drag = Math.exp(-dt * .5); s.vx *= drag; s.vy *= drag; }
     s.x += s.vx * dt; s.y += s.vy * dt;
   }
 }
@@ -616,10 +888,10 @@ function putOverlay(x, y, c, glyph) {
 }
 
 // Where fireflies may fly, in screen heights from the top-left: inside the frame, below
-// the menu bar, and outside a shape round the logs that narrows up to the flame tips.
+// the menu bar, and outside a shape round the hearth that narrows up to the flame tips.
 function flyBounds() {
   const aspect = W / H, u = aspect * CFG.fireWidth, floor = 1 - CFG.floorY;
-  return { minX: .02, maxX: aspect - .02, minY: .05, maxY: .975, cx: aspect / 2, top: floor - 3 * u, neck: floor - .55 * u, bottom: Math.min(.955, floor + .62 * u), wide: 1.6 * u + .02, tip: .55 * u + .02 };
+  return { minX: .02, maxX: aspect - .02, minY: .05, maxY: .975, cx: aspect / 2, top: floor - 3 * FIRE * u, neck: floor - .55 * FIRE * u, bottom: Math.min(.955, floor + .85 * u), wide: (RING_X + .3) * u + .02, tip: .55 * FIRE * u + .02 };
 }
 function fireHalfWidth(b, y) { return y >= b.neck ? b.wide : b.tip + (b.wide - b.tip) * (y - b.top) / (b.neck - b.top); }
 function inFire(b, x, y) { return y > b.top && y < b.bottom && Math.abs(x - b.cx) < fireHalfWidth(b, y); }
@@ -677,13 +949,19 @@ function drawFlies() {
     const b = clamp(.22 + .78 * pulse + f.fright, 0, 1);
     const core = [.55, 1, .32].map(v => v * b);
     const x = Math.floor(f.x * H / cw), y = Math.floor(f.y * H / ch);
-    putOverlay(x, y, core, G[f.small ? "\u2022" : "\u25CF"]);
+    putOverlay(x, y, core, G[f.small ? "•" : "●"]);
   }
 }
 
-function sparkColour(u) {
-  const t = 1 - u;
-  return [1, .35 + .55 * t, .05 + .45 * t * t];
+// A spark starts almost white and cools through orange to a dull red.
+function drawSparks() {
+  for (const s of sparks) {
+    const u = s.age / s.life, t = 1 - u;
+    const b = s.heat * Math.min(1, t * 3) * (.8 + .2 * Math.sin(s.seed + T * 9));
+    const c = [b, (.3 + .6 * t) * b, (.04 + .5 * t * t) * b];
+    if (!s.floater) putOverlay(Math.floor(s.px), Math.floor(s.py), [c[0] * .45, c[1] * .4, c[2] * .3], G["."]);
+    putOverlay(Math.floor(s.x), Math.floor(s.y), c, G[s.floater ? (u < .5 ? "'" : ".") : u < .3 ? "*" : u < .55 ? "+" : u < .8 ? "'" : "."]);
+  }
 }
 
 function render() {
@@ -700,20 +978,21 @@ function render() {
   gl.uniform1f(sim.u.uFlick, flick);
   gl.uniform1f(sim.u.uFlash, flash);
   gl.uniform1f(sim.u.uWind, wind);
+  gl.uniform1f(sim.u.uAir, wind + breeze);
+  gl.uniform1f(sim.u.uSmoke, smoke * CFG.smoke);
+  gl.uniform1f(sim.u.uScenery, CFG.scenery);
+  // The lamp wanders a little, so the shadows the stones throw are never still.
+  gl.uniform3f(sim.u.uLamp, (noise1(T * .8) - .5) * .35, 1 + .45 * level, (noise1(T * .6 + 30) - .5) * .25);
   gl.uniform4fv(sim.u.uRoot, rootData);
   gl.uniform4fv(sim.u.uTong, tongData);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, simTex);
+  gl.bindTexture(gl.TEXTURE_2D, glowTex);
   gl.generateMipmap(gl.TEXTURE_2D);
 
   overlay.fill(0);
   if (fliesOn) drawFlies();
-  for (const s of sparks) {
-    const u = s.age / s.life, c = sparkColour(u);
-    putOverlay(Math.floor(s.px), Math.floor(s.py), [c[0] * .5, c[1] * .5, c[2] * .5], G["."]);
-    putOverlay(Math.floor(s.x), Math.floor(s.y), c, G[u < .4 ? "*" : (u < .75 ? "'" : ".")]);
-  }
+  drawSparks();
   gl.bindTexture(gl.TEXTURE_2D, overlayTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, overlay);
 
@@ -722,14 +1001,17 @@ function render() {
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex); gl.uniform1i(draw.u.uSim, 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, overlayTex); gl.uniform1i(draw.u.uOverlay, 1);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, atlasTex); gl.uniform1i(draw.u.uAtlas, 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, glowTex); gl.uniform1i(draw.u.uGlowTex, 3);
   gl.uniform1i(draw.u.uCW, cw);
   gl.uniform1i(draw.u.uCH, ch);
   gl.uniform1i(draw.u.uH, H);
   gl.uniform1i(draw.u.uGap, Math.max(1, Math.round((window.devicePixelRatio || 1) * .5)));
-  gl.uniform1i(draw.u.uRamp, RAMP.length);
   gl.uniform2f(draw.u.uRes, W, H);
+  gl.uniform2f(draw.u.uFire, W / 2, H * CFG.floorY + W * CFG.fireWidth * .8 * FIRE);
+  gl.uniform1f(draw.u.uUnit, W * CFG.fireWidth);
   gl.uniform1f(draw.u.uT, T);
   gl.uniform1f(draw.u.uGlow, clamp(level * 2.5 + embers * .8 + flash * .6, 0, 1));   // no haze over cold logs
+  gl.uniform1f(draw.u.uHalo, level * (1 + (flick - 1.05) * .4) + embers * .06);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.activeTexture(gl.TEXTURE0);
 }
@@ -756,12 +1038,13 @@ const ascii = window.ascii = {
   setPaused(p) { paused = p; if (!p) { last = 0; wall = 0; requestAnimationFrame(loop); } },
   // For testing: advance instantly, and render one frame to a PNG.
   warp(seconds) { for (let i = 0; i < seconds * 30; i++) step(1 / 30); },
-  state: () => ({ phase, level: +level.toFixed(3), embers: +embers.toFixed(3), charge: +charge.toFixed(2), burnLeft: Math.round(burnLeft), flyNearest: flies.reduce((n, f) => Math.min(n, Math.hypot(f.x - mouse.x, f.y - mouse.y)), 9), flyInFire: flies.filter(f => inFire(flyBounds(), f.x, f.y)).length, flyOutside: flies.filter(f => outOfFrame(flyBounds(), f.x, f.y)).length }),
+  state: () => ({ phase, level: +level.toFixed(3), embers: +embers.toFixed(3), smoke: +smoke.toFixed(3), charge: +charge.toFixed(2), burnLeft: Math.round(burnLeft), sparks: sparks.length, flyNearest: flies.reduce((n, f) => Math.min(n, Math.hypot(f.x - mouse.x, f.y - mouse.y)), 9), flyInFire: flies.filter(f => inFire(flyBounds(), f.x, f.y)).length, flyOutside: flies.filter(f => outOfFrame(flyBounds(), f.x, f.y)).length }),
   frame() { render(); return canvas.toDataURL("image/png"); },
   // The lock screen picture: a fully burning fire, always the same one. Whatever
   // the live fire is doing is put back afterwards, so this can't light it.
   still() {
-    const keep = { phase, phaseAge, level, embers, charge, flash, burnLeft, surge, press, T, flick, wind, windGoal };
+    const keep = { phase, phaseAge, level, embers, charge, flash, burnLeft, surge, press, T, flick, wind, windGoal, breeze, smoke, crackleIn };
+    const keptSparks = sparks.splice(0);
     const random = Math.random;
     let seed = CFG.stillSeed;
     Math.random = () => {
@@ -771,17 +1054,17 @@ const ascii = window.ascii = {
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
     fliesOn = false;   // the lock screen stays the same picture every time
-    phase = "burning"; level = 1; embers = 1; burnLeft = 1e9;
+    phase = "burning"; level = 1; embers = 1; burnLeft = 1e9; smoke = .4; crackleIn = 2;
     surge = 0; flash = 0; press = null; wind = windGoal = 0; T = 40;
-    sparks.length = 0;
-    tongues.forEach(t => { t.started = false; respawn(t); });
+    tongues.forEach((t, i) => { t.started = false; respawn(t, i); });
     for (let i = 0; i < 150; i++) step(1 / 30);
     render();
     const png = canvas.toDataURL("image/png");
     Math.random = random;
     fliesOn = true;
-    ({ phase, phaseAge, level, embers, charge, flash, burnLeft, surge, press, T, flick, wind, windGoal } = keep);
+    ({ phase, phaseAge, level, embers, charge, flash, burnLeft, surge, press, T, flick, wind, windGoal, breeze, smoke, crackleIn } = keep);
     sparks.length = 0;
+    sparks.push(...keptSparks);
     stepTongues(0);
     render();
     return png;
